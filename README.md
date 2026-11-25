@@ -2,9 +2,9 @@
 
 > **This fork** adds Arabic SMS, a prayer-times page with Hijri date, a 12-hour clock, SMS delete, Tailscale and Services pages, a power page and a 4G/5G network-mode switch. See **[FORK_CHANGES.md](FORK_CHANGES.md)**.
 
-| Prayer times | Arabic SMS | Tailscale | Services |
+| Prayer times | Arabic SMS | Active SIM | Power |
 |---|---|---|---|
-| ![Prayer](screenshots/fork/05_prayer_page.png) | ![SMS](screenshots/fork/03_sms_detail_arabic_delete.png) | ![Tailscale](screenshots/fork/10_tailscale_page.png) | ![Services](screenshots/fork/13_services_page.png) |
+| ![Prayer](screenshots/fork/08_prayer.png) | ![SMS](screenshots/fork/14_sms_detail.png) | ![SIM](screenshots/fork/02_sim.png) | ![Power](screenshots/fork/09_power.png) |
 
 A custom, fully interactive replacement for the stock `gl_screen` UI on the
 GL.iNet GL-E5800's built-in 240x320 touchscreen. Swipe between seven panels,

@@ -1,6 +1,6 @@
 # Fork changes (on top of v3.2.1)
 
-Changes made on a GL-E5800 (Mudi 7) and tested live on the device, on firmware 4.10.3 and 4.10.4. The upstream project is [robavionix/gl-e5800-dashboard](https://github.com/robavionix/gl-e5800-dashboard) (MIT). Every screenshot is rendered by the dashboard itself, with demo data where real data would be private.
+Changes made on a GL-E5800 (Mudi 7) and tested live on the device, on firmware 4.10.3 and 4.10.4. The upstream project is [robavionix/gl-e5800-dashboard](https://github.com/robavionix/gl-e5800-dashboard) (MIT). Every screenshot is rendered by the dashboard itself, taken from the author's own device (the carrier name is replaced with "Carrier").
 
 Install exactly as upstream: `./install.sh [router-ip]`. It now also copies the Arabic font and installs `zoneinfo-africa`.
 
@@ -26,7 +26,7 @@ Your UCS2 decoding in `_parse_sms_file` was already correct. Only the rendering 
 - `sms_wrap()` and `sms_truncate()` are cached and handle word-wrap and ellipsis. RTL lines hug the right margin.
 - Text without Arabic takes exactly the old code path.
 
-![SMS list](screenshots/fork/02_sms_list_arabic.png) ![SMS detail](screenshots/fork/03_sms_detail_arabic_delete.png)
+![SMS list](screenshots/fork/13_sms_list.png) ![SMS detail](screenshots/fork/14_sms_detail.png)
 
 ## 2. SMS inbox fixes
 
@@ -36,7 +36,7 @@ Your UCS2 decoding in `_parse_sms_file` was already correct. Only the rendering 
 - **Message view auto-fits:** the font steps down from 15 to 11 px until the whole message fits above the button, since that screen has no scrolling.
 - **Home tile** now shows the message count only ("2 messages"), not the sender and text. That was my preference, for privacy on a screen that's always visible.
 
-![Home](screenshots/fork/01_home_12h_sms_count.png) ![Delete confirm](screenshots/fork/04_sms_delete_confirm.png)
+![Home](screenshots/fork/01_home.png)
 
 ## 3. Prayer times page (new page, 8th dot)
 
@@ -54,7 +54,7 @@ Your UCS2 decoding in `_parse_sms_file` was already correct. Only the rendering 
   - It has an Alert ON/OFF pill on the page.
   - It won't fire twice for the same prayer, including across a dashboard restart.
 
-![Prayer](screenshots/fork/05_prayer_page.png) ![Alert](screenshots/fork/06_prayer_alert.png) ![Country](screenshots/fork/07_prayer_country_picker.png) ![City](screenshots/fork/08_prayer_city_picker.png) ![London](screenshots/fork/09_prayer_page_london.png)
+![Prayer](screenshots/fork/08_prayer.png) ![Alert](screenshots/fork/15_prayer_alert.png) ![Country](screenshots/fork/11_prayer_country.png) ![City](screenshots/fork/12_prayer_city.png)
 
 ## 4. 12-hour clock
 
@@ -71,7 +71,7 @@ OpenClash isn't installed on my unit, so that page was dead. The Tailscale page 
 
 A checklist shows each step live. An exit-node picker lists the online peers that offer exit, and remembers them in config. "Off" sends the same cleared values the web UI does.
 
-![Tailscale](screenshots/fork/10_tailscale_page.png) ![Partial](screenshots/fork/11_tailscale_partial.png) ![Exit picker](screenshots/fork/12_tailscale_exit_picker.png)
+![Tailscale](screenshots/fork/06_tailscale.png)
 
 **Bug found on the way: no internet after enabling an exit node, on a self-hosted control server (Headscale with embedded DERP).**
 - On the E5800, `/etc/resolv.conf` points at the **carrier's DNS**, not dnsmasq.
@@ -92,19 +92,21 @@ It has four cards, each with a toggle that's verified against the real state, vi
 
 WireGuard and Tor both route all traffic, so their confirm dialog warns when a Tailscale exit node is also active.
 
-![Services](screenshots/fork/13_services_page.png)
+![Services](screenshots/fork/07_services.png)
 
 ## 7. Small things
 
 - **QAR** has been added to `CURRENCIES` and `CURRENCY_NAMES` (for USD→QAR and GBP→QAR).
 - `draw_page_dots()` now defaults to `len(PANEL_NAMES)` instead of a hard-coded 7, so adding a page doesn't break the dots.
 
-![FX](screenshots/fork/14_fx_qar.png)
+![FX](screenshots/fork/05_fx.png)
 
 ## 8. Power page (new page, 9th dot) and power-button hold
 
 - A last page with one big power button. Tapping it opens a menu: **Shut down**, **Reboot**, **Exit dashboard** (back to the stock UI), **Cancel**.
 - Holding the hardware power button (~1 s) used to offer only "exit dashboard?", so the device could not be powered off from the button while the dashboard was running. The hold now opens the same menu.
+![Power page](screenshots/fork/09_power.png) ![Power menu](screenshots/fork/10_power_menu.png)
+
 - `toggle.sh off` is now temporary: it stops the dashboard and starts the stock UI without changing what starts at boot, so the dashboard always comes back after a reboot. `toggle.sh on` still makes it the boot default.
 
 ## 9. Network mode on the Active SIM page (replaces the WireGuard tile)
@@ -114,6 +116,8 @@ WireGuard already lives on the Services page, so its tile on the SIM page became
 1. `set_bands {mode}`: MudiModem arms its own 60 s revert watchdog.
 2. The dashboard pings 8.8.8.8 for up to 45 s.
 3. If the internet is back it calls `confirm`, otherwise `revert_now`, so a mode with no coverage can never strand the device offline.
+
+![Active SIM](screenshots/fork/02_sim.png)
 
 Without MudiModem no mode is highlighted and a tap just reports that the switch failed; nothing on the modem changes.
 
