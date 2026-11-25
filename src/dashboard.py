@@ -48,6 +48,10 @@ ACCENT = {
     "fx": (255, 190, 90),
     "sim": (110, 220, 150),
     "openclash": (200, 140, 255),
+    "tailscale": (120, 160, 255),
+    "services": (150, 220, 120),
+    "prayer": (110, 215, 170),
+    "power": (240, 110, 110),
     "weather": (90, 214, 200),
     "monitor": (235, 120, 160),
     "games": (255, 210, 90),
@@ -69,6 +73,7 @@ CITIES = [
     ("Pacific/Auckland", "Auckland"),
     ("Europe/Berlin", "Berlin"),
     ("America/Chicago", "Chicago"),
+    ("Asia/Qatar", "Doha"),
     ("Asia/Dubai", "Dubai"),
     ("Asia/Hong_Kong", "Hong Kong"),
     ("Europe/London", "London"),
@@ -84,11 +89,12 @@ CITIES = [
     ("America/Toronto", "Toronto"),
 ]
 
-CURRENCIES = ["CNY", "JPY", "CAD", "AUD", "SGD", "NZD", "GBP", "EUR", "USD", "HKD"]
+CURRENCIES = ["CNY", "JPY", "CAD", "AUD", "SGD", "NZD", "GBP", "EUR", "USD", "HKD", "QAR"]
 CURRENCY_NAMES = {
     "CNY": "Chinese Yuan", "JPY": "Japanese Yen", "CAD": "Canadian Dollar", "AUD": "Australian Dollar",
     "SGD": "Singapore Dollar", "NZD": "NZ Dollar", "GBP": "British Pound",
     "EUR": "Euro", "USD": "US Dollar", "HKD": "Hong Kong Dollar",
+    "QAR": "Qatari Riyal",
 }
 
 DATA_CAP_PRESETS = [
@@ -111,6 +117,7 @@ WEATHER_CITIES = [
     ("Cardiff", 51.4816, -3.1791),
     ("Chicago", 41.8781, -87.6298),
     ("Coventry", 52.4068, -1.5197),
+    ("Doha", 25.2854, 51.5310),
     ("Dubai", 25.2048, 55.2708),
     ("Edinburgh", 55.9533, -3.1883),
     ("Exeter", 50.7184, -3.5339),
@@ -156,6 +163,20 @@ DEFAULT_CONFIG = {
     "data_cap_mb": None,
     "weather_city": "London",
     "clock_style": "digital",
+    # Tailscale page (local addition): what "on" re-applies every time,
+    # since GL's own off path clears the exit node / masquerading / subnet
+    # advertisement and they'd otherwise have to be set again by hand.
+    "ts_exit_node": "",
+    "ts_masq": True,
+    "ts_lan": True,
+    "ts_wan": True,
+    "ts_exit_cache": [],
+    "prayer_country": "Qatar",
+    "prayer_city": "Doha",
+    "prayer_alert": True,
+    # Days added to the tabular Hijri date; Qatar follows moon sighting, so
+    # it can be a day off. +1 matched the Awqaf app on 2026-11-24.
+    "hijri_offset": 1,
 }
 
 _fonts = {}
@@ -733,7 +754,10 @@ def aqi_category(aqi):
 # deletes spool files, so it can't interfere with any other consumer
 # (e.g. GL.iNet's own SMS forwarding) that might also be watching these
 # directories.
-SMS_SPOOL_DIRS = ["/etc/spool/sms/incoming", "/etc/spool/sms/checked"]
+# "storage" is where GL's SMS manager moves messages once it has handled
+# them -- confirmed live: a message the GL web UI listed was only there,
+# so the inbox here showed one message where the web UI showed two.
+SMS_SPOOL_DIRS = ["/etc/spool/sms/incoming", "/etc/spool/sms/checked", "/etc/spool/sms/storage"]
 
 
 def _parse_sms_file(path):
@@ -761,6 +785,11 @@ def _parse_sms_file(path):
         if ":" in line:
             k, v = line.split(":", 1)
             fields[k.strip().lower()] = v.strip()
+    if "from" not in fields:
+        # Not a message: e.g. smstools' "GMS1-concatenated" holds raw PDU
+        # parts of a multipart SMS still being assembled -- it used to show
+        # up as an empty "Unknown" entry.
+        return None
     alphabet = fields.get("alphabet", "").upper()
     if alphabet in ("UCS2", "UCS-2", "UTF-16", "UTF16"):
         body = body_bytes.decode("utf-16-be", errors="replace")
@@ -776,6 +805,7 @@ def _parse_sms_file(path):
         "sent": sent,
         "sent_raw": sent_raw,
         "body": body.strip(),
+        "path": str(path),
     }
 
 
@@ -787,6 +817,8 @@ def get_sms_messages():
             continue
         for f in p.iterdir():
             if not f.is_file():
+                continue
+            if f.name.endswith("-concatenated"):
                 continue
             msg = _parse_sms_file(f)
             if msg:
@@ -2650,11 +2682,20 @@ def draw_analog_clock(d, cx, cy, r, dt, accent):
     d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=accent)
 
 
+def hm12(dt):
+    """12-hour clock time without a leading zero: 7:05, 12:30."""
+    return f"{dt.hour % 12 or 12}:{dt.minute:02d}"
+
+
+def ampm(dt):
+    return "AM" if dt.hour < 12 else "PM"
+
+
 def draw_digital_clock(d, cx, cy, dt, accent):
     f_time = font("default_mono_medium", 30)
-    centered_text(d, cx, cy - 20, dt.strftime("%H:%M"), f_time, FG)
+    centered_text(d, cx, cy - 20, hm12(dt), f_time, FG)
     f_sec = font("default_medium", 13)
-    centered_text(d, cx, cy + 14, dt.strftime(":%S"), f_sec, accent)
+    centered_text(d, cx, cy + 14, dt.strftime(":%S ") + ampm(dt), f_sec, accent)
 
 
 def _draw_aa(d, x0, y0, w, h, color, draw_fn, scale=4):
@@ -2823,10 +2864,12 @@ def new_canvas():
     return img, ImageDraw.Draw(img)
 
 
-def draw_page_dots(d, active_idx, count=7):
+def draw_page_dots(d, active_idx, count=None):
     """Dot centres are 16px apart, so the row spans (count - 1) * 16
     between the first and last centre -- centring on that, not on
     count * 16, which put the whole row 8px left of the screen's middle."""
+    if count is None:
+        count = len(PANEL_NAMES)
     step = 16
     x0 = W / 2 - (count - 1) * step / 2
     y = H - 18
@@ -3089,6 +3132,654 @@ def wrap_text_to_lines(d, text, f, max_w):
     return lines
 
 
+# ---------- Arabic text (SMS) ----------
+#
+# None of GL's bundled screen fonts carry a single Arabic glyph (checked
+# live: every Arabic code point renders as the .notdef box), and Pillow on
+# this device is built without libraqm, so it can neither shape Arabic
+# (join letters) nor lay it out right-to-left. Both are done here instead:
+#   1. ar_shape(): contextual shaping into Unicode presentation forms
+#      (isolated / final / initial / medial + lam-alef ligatures);
+#   2. _bidi_visual(): a small bidi reorder -- Arabic runs reversed,
+#      Latin/number runs kept left-to-right, neutrals resolved by their
+#      neighbours, paragraph direction from the first strong character;
+#   3. drawing in runs: Arabic glyphs from a bundled Noto Sans Arabic,
+#      everything else from the usual GL font, on one shared baseline.
+# Text with no Arabic in it takes the exact old code path.
+
+AR_FONT_FILE = STATE_DIR / "fonts" / "NotoSansArabic-Medium.ttf"
+_ar_fonts = {}
+
+
+def ar_font(size):
+    if size not in _ar_fonts:
+        try:
+            _ar_fonts[size] = ImageFont.truetype(str(AR_FONT_FILE), size)
+        except Exception:
+            _ar_fonts[size] = None
+    return _ar_fonts[size]
+
+
+# code point -> (first presentation form, number of forms). 4 forms are
+# isolated/final/initial/medial; 2 forms (right-joining letters) are
+# isolated/final only.
+_AR_TABLE = {
+    0x0621: (0xFE80, 1), 0x0622: (0xFE81, 2), 0x0623: (0xFE83, 2), 0x0624: (0xFE85, 2),
+    0x0625: (0xFE87, 2), 0x0626: (0xFE89, 4), 0x0627: (0xFE8D, 2), 0x0628: (0xFE8F, 4),
+    0x0629: (0xFE93, 2), 0x062A: (0xFE95, 4), 0x062B: (0xFE99, 4), 0x062C: (0xFE9D, 4),
+    0x062D: (0xFEA1, 4), 0x062E: (0xFEA5, 4), 0x062F: (0xFEA9, 2), 0x0630: (0xFEAB, 2),
+    0x0631: (0xFEAD, 2), 0x0632: (0xFEAF, 2), 0x0633: (0xFEB1, 4), 0x0634: (0xFEB5, 4),
+    0x0635: (0xFEB9, 4), 0x0636: (0xFEBD, 4), 0x0637: (0xFEC1, 4), 0x0638: (0xFEC5, 4),
+    0x0639: (0xFEC9, 4), 0x063A: (0xFECD, 4), 0x0641: (0xFED1, 4), 0x0642: (0xFED5, 4),
+    0x0643: (0xFED9, 4), 0x0644: (0xFEDD, 4), 0x0645: (0xFEE1, 4), 0x0646: (0xFEE5, 4),
+    0x0647: (0xFEE9, 4), 0x0648: (0xFEED, 2), 0x0649: (0xFEEF, 2), 0x064A: (0xFEF1, 4),
+    0x067E: (0xFB56, 4), 0x0686: (0xFB7A, 4), 0x0698: (0xFB8A, 2), 0x06A9: (0xFB8E, 4),
+    0x06AF: (0xFB92, 4), 0x06CC: (0xFBFC, 4),
+}
+# alef variant -> isolated lam-alef ligature (final form is +1)
+_LAM_ALEF = {0x0622: 0xFEF5, 0x0623: 0xFEF7, 0x0625: 0xFEF9, 0x0627: 0xFEFB}
+_MIRROR = {"(": ")", ")": "(", "[": "]", "]": "[", "{": "}", "}": "{",
+           "<": ">", ">": "<", "«": "»", "»": "«"}
+
+
+def _is_haraka(o):
+    return (0x064B <= o <= 0x065F or o == 0x0670 or 0x0610 <= o <= 0x061A
+            or 0x06D6 <= o <= 0x06ED)
+
+
+def _ar_joins_next(o):
+    t = _AR_TABLE.get(o)
+    return o == 0x0640 or (t is not None and t[1] == 4)
+
+
+def ar_shape(text):
+    """Logical-order Arabic -> presentation forms (still logical order).
+    Diacritics are dropped: without a shaping engine they can't be placed
+    over their letters, and SMS text almost never carries them."""
+    cps = [ord(c) for c in text if not _is_haraka(ord(c))]
+    out, i, n = [], 0, len(cps)
+    while i < n:
+        o = cps[i]
+        t = _AR_TABLE.get(o)
+        if t is None:
+            out.append(chr(o))
+            i += 1
+            continue
+        joins_prev = i > 0 and _ar_joins_next(cps[i - 1])
+        nxt = cps[i + 1] if i + 1 < n else None
+        if o == 0x0644 and nxt in _LAM_ALEF:
+            out.append(chr(_LAM_ALEF[nxt] + (1 if joins_prev else 0)))
+            i += 2
+            continue
+        base, cnt = t
+        joins_next = cnt == 4 and nxt is not None and (nxt in _AR_TABLE or nxt == 0x0640)
+        if cnt == 1:
+            form = base
+        elif cnt == 2:
+            form = base + (1 if joins_prev else 0)
+        else:
+            form = base + (3 if joins_prev and joins_next else
+                           1 if joins_prev else 2 if joins_next else 0)
+        out.append(chr(form))
+        i += 1
+    return "".join(out)
+
+
+def _is_ar_glyph(ch):
+    o = ord(ch)
+    return (0x0600 <= o <= 0x06FF or 0x0750 <= o <= 0x077F
+            or 0xFB50 <= o <= 0xFDFF or 0xFE70 <= o <= 0xFEFF)
+
+
+def _ar_cls(ch):
+    o = ord(ch)
+    if 0x0660 <= o <= 0x0669 or 0x06F0 <= o <= 0x06F9:
+        return "L"                      # Arabic-Indic digits read left-to-right
+    if _is_ar_glyph(ch):
+        return "R"
+    if ch.isalnum():
+        return "L"
+    return "N"
+
+
+def has_arabic(text):
+    return any(_ar_cls(c) == "R" for c in text or "")
+
+
+def text_is_rtl(text):
+    for c in text:
+        k = _ar_cls(c)
+        if k != "N":
+            return k == "R"
+    return False
+
+
+def _bidi_visual(line, rtl):
+    cls = [_ar_cls(c) for c in line]
+    n, para = len(line), ("R" if rtl else "L")
+    # Keep number-like tokens in one left-to-right piece: USSD codes
+    # (*123#, *100*1#), +974..., 50%, 15:00, 1.5 -- otherwise the symbols
+    # touching the digits get flipped to the wrong side in an RTL line.
+    changed = True
+    while changed:
+        changed = False
+        for k, c in enumerate(line):
+            if cls[k] != "N":
+                continue
+            lft = k > 0 and cls[k - 1] == "L" and (line[k - 1].isdigit() or line[k - 1] in "*#+")
+            rgt = k + 1 < n and cls[k + 1] == "L" and (line[k + 1].isdigit() or line[k + 1] in "*#+")
+            if (c in "*#+%" and (lft or rgt)) or (c in ":.,/" and lft and rgt):
+                cls[k] = "L"
+                changed = True
+    res, i = cls[:], 0
+    while i < n:
+        if cls[i] != "N":
+            i += 1
+            continue
+        j = i
+        while j < n and cls[j] == "N":
+            j += 1
+        before = cls[i - 1] if i > 0 else para
+        after = cls[j] if j < n else para
+        for k in range(i, j):
+            res[k] = before if before == after else para
+        i = j
+    runs = []
+    for ch, r in zip(line, res):
+        if runs and runs[-1][0] == r:
+            runs[-1][1].append(ch)
+        else:
+            runs.append([r, [ch]])
+    parts = ["".join(_MIRROR.get(c, c) for c in reversed(chars)) if r == "R" else "".join(chars)
+             for r, chars in runs]
+    if rtl:
+        parts.reverse()
+    return "".join(parts)
+
+
+def _mixed_runs(text, base_font, size):
+    af = ar_font(size)
+    runs = []
+    for ch in text:
+        if ch == " " and runs:
+            runs[-1][1] += ch
+            continue
+        f = af if (af is not None and _is_ar_glyph(ch)) else base_font
+        if runs and runs[-1][0] is f:
+            runs[-1][1] += ch
+        else:
+            runs.append([f, ch])
+    return runs
+
+
+def mixed_width(text, base_font, size):
+    return sum(f.getlength(s) for f, s in _mixed_runs(text, base_font, size))
+
+
+_sms_text_cache = {}
+
+
+def _sms_cached(key, fn):
+    hit = _sms_text_cache.get(key)
+    if hit is None:
+        if len(_sms_text_cache) > 200:
+            _sms_text_cache.clear()
+        hit = _sms_text_cache[key] = fn()
+    return hit
+
+
+def sms_truncate(d, text, base_name, size, max_w):
+    """One line, cut to max_w with an ellipsis -> (visual text, rtl)."""
+    base_font = font(base_name, size)
+    if not has_arabic(text):
+        return truncate_to_width(d, text, base_font, max_w), False
+
+    def work():
+        shaped = ar_shape(text)
+        rtl = text_is_rtl(text)
+        if mixed_width(shaped, base_font, size) <= max_w:
+            return _bidi_visual(shaped, rtl), rtl
+        lo, hi = 1, len(shaped) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if mixed_width(shaped[:mid].rstrip() + "…", base_font, size) <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        return _bidi_visual(shaped[:lo].rstrip() + "…", rtl), rtl
+    return _sms_cached(("t", text, base_name, size, max_w), work)
+
+
+def sms_wrap(d, text, base_name, size, max_w):
+    """Word-wrapped lines -> [(visual text, rtl), ...]."""
+    base_font = font(base_name, size)
+    if not has_arabic(text):
+        return [(l, False) for l in wrap_text_to_lines(d, text, base_font, max_w)]
+
+    def work():
+        rtl = text_is_rtl(text)
+        out = []
+        for para in ar_shape(text).split("\n"):
+            line = ""
+            for word in para.split(" "):
+                cand = (line + " " + word) if line else word
+                if not line or mixed_width(cand, base_font, size) <= max_w:
+                    line = cand
+                else:
+                    out.append(line)
+                    line = word
+                while mixed_width(line, base_font, size) > max_w and len(line) > 1:
+                    cut = len(line) - 1
+                    while cut > 1 and mixed_width(line[:cut], base_font, size) > max_w:
+                        cut -= 1
+                    out.append(line[:cut])
+                    line = line[cut:]
+            out.append(line)
+        return [(_bidi_visual(l.strip(), rtl), rtl) for l in out]
+    return _sms_cached(("w", text, base_name, size, max_w), work)
+
+
+def draw_sms_text(d, x0, x1, y, visual, rtl, base_name, size, fill):
+    """Draw a line from sms_truncate/sms_wrap; RTL lines hug x1."""
+    base_font = font(base_name, size)
+    runs = _mixed_runs(visual, base_font, size)
+    w = sum(f.getlength(s) for f, s in runs)
+    x = (x1 - w) if rtl else x0
+    baseline = y + base_font.getmetrics()[0]
+    for f, s in runs:
+        d.text((x, baseline), s, font=f, fill=fill, anchor="ls")
+        x += f.getlength(s)
+
+
+
+# ---------- Prayer times ----------
+#
+# Computed locally (no internet needed, so it works abroad on any SIM) with
+# the standard astronomical method used by praytimes.org: sun declination
+# and equation of time per day, Fajr/Isha from a twilight angle (or a fixed
+# number of minutes after Maghrib), Asr from the shadow factor, and an
+# angle-based fallback at high latitudes where twilight never ends in
+# summer. The city is picked by hand on the screen (country -> city); each
+# country carries the calculation method its own authorities use.
+
+# method -> (fajr angle, isha angle or "Nm" minutes after maghrib)
+PRAYER_METHODS = {
+    "qatar": (18.0, "90m"),
+    "umm_al_qura": (18.5, "90m"),
+    "uae": (18.2, 18.2),
+    "kuwait": (18.0, 17.5),
+    "oman": (18.0, 18.0),
+    "egypt": (19.5, 17.5),
+    "jordan": (18.0, 18.0),
+    "turkey": (18.0, 17.0),
+    "morocco": (19.0, 17.0),
+    "mwl": (18.0, 17.0),
+    "isna": (15.0, 15.0),
+    "karachi": (18.0, 18.0),
+    "sea": (20.0, 18.0),
+}
+
+# Per-method corrections so the result matches the official timetable,
+# not just the textbook angles. Qatar: checked against the Awqaf app for
+# Doha on 2026-11-24 (Fajr 4:36, Sunrise 5:57, Dhuhr 11:21, Asr 2:24,
+# Maghrib 4:46, Isha 6:16) -- precautionary rounding, Fajr -1, Maghrib +2.
+PRAYER_ADJUST = {
+    "qatar": {"ihtiyat": True, "fajr": -1, "maghrib": 2},
+}
+
+# country -> (method, asr shadow factor, tz, [(city, lat, lon), ...])
+PRAYER_COUNTRIES = {
+    "Qatar": ("qatar", 1, "Asia/Qatar", [
+        ("Doha", 25.2854, 51.5310), ("Al Wakrah", 25.1659, 51.6038),
+        ("Al Khor", 25.6804, 51.4969), ("Dukhan", 25.4248, 50.7853)]),
+    "Saudi Arabia": ("umm_al_qura", 1, "Asia/Riyadh", [
+        ("Makkah", 21.3891, 39.8579), ("Madinah", 24.5247, 39.5692),
+        ("Riyadh", 24.7136, 46.6753), ("Jeddah", 21.4858, 39.1925),
+        ("Dammam", 26.4207, 50.0888)]),
+    "UAE": ("uae", 1, "Asia/Dubai", [
+        ("Dubai", 25.2048, 55.2708), ("Abu Dhabi", 24.4539, 54.3773),
+        ("Sharjah", 25.3463, 55.4209)]),
+    "Kuwait": ("kuwait", 1, "Asia/Kuwait", [("Kuwait City", 29.3759, 47.9774)]),
+    "Bahrain": ("umm_al_qura", 1, "Asia/Bahrain", [("Manama", 26.2285, 50.5860)]),
+    "Oman": ("oman", 1, "Asia/Muscat", [("Muscat", 23.5880, 58.3829), ("Salalah", 17.0151, 54.0924)]),
+    "Egypt": ("egypt", 1, "Africa/Cairo", [("Cairo", 30.0444, 31.2357), ("Alexandria", 31.2001, 29.9187)]),
+    "Jordan": ("jordan", 1, "Asia/Amman", [("Amman", 31.9454, 35.9284)]),
+    "Lebanon": ("mwl", 1, "Asia/Beirut", [("Beirut", 33.8938, 35.5018)]),
+    "Turkey": ("turkey", 1, "Europe/Istanbul", [("Istanbul", 41.0082, 28.9784), ("Ankara", 39.9334, 32.8597), ("Trabzon", 41.0027, 39.7168)]),
+    "Morocco": ("morocco", 1, "Africa/Casablanca", [("Casablanca", 33.5731, -7.5898), ("Marrakesh", 31.6295, -7.9811)]),
+    "Azerbaijan": ("mwl", 1, "Asia/Baku", [("Baku", 40.4093, 49.8671)]),
+    "Georgia": ("mwl", 1, "Asia/Tbilisi", [("Tbilisi", 41.7151, 44.8271)]),
+    "Bosnia": ("mwl", 1, "Europe/Sarajevo", [("Sarajevo", 43.8563, 18.4131)]),
+    "UK": ("mwl", 1, "Europe/London", [
+        ("London", 51.5074, -0.1278), ("Manchester", 53.4808, -2.2426),
+        ("Birmingham", 52.4862, -1.8904), ("Edinburgh", 55.9533, -3.1883)]),
+    "Germany": ("mwl", 1, "Europe/Berlin", [("Berlin", 52.5200, 13.4050), ("Munich", 48.1351, 11.5820), ("Frankfurt", 50.1109, 8.6821)]),
+    "France": ("mwl", 1, "Europe/Paris", [("Paris", 48.8566, 2.3522)]),
+    "Netherlands": ("mwl", 1, "Europe/Amsterdam", [("Amsterdam", 52.3676, 4.9041)]),
+    "Switzerland": ("mwl", 1, "Europe/Zurich", [("Zurich", 47.3769, 8.5417), ("Geneva", 46.2044, 6.1432), ("Interlaken", 46.6863, 7.8632)]),
+    "Austria": ("mwl", 1, "Europe/Vienna", [("Vienna", 48.2082, 16.3738), ("Zell am See", 47.3237, 12.7958)]),
+    "Italy": ("mwl", 1, "Europe/Rome", [("Rome", 41.9028, 12.4964), ("Milan", 45.4642, 9.1900)]),
+    "Spain": ("mwl", 1, "Europe/Madrid", [("Madrid", 40.4168, -3.7038), ("Barcelona", 41.3874, 2.1686)]),
+    "USA": ("isna", 1, "America/New_York", [("New York", 40.7128, -74.0060)]),
+    "USA West": ("isna", 1, "America/Los_Angeles", [("Los Angeles", 34.0522, -118.2437)]),
+    "Canada": ("isna", 1, "America/Toronto", [("Toronto", 43.6532, -79.3832)]),
+    "Pakistan": ("karachi", 2, "Asia/Karachi", [("Karachi", 24.8607, 67.0011), ("Lahore", 31.5204, 74.3587)]),
+    "Malaysia": ("sea", 1, "Asia/Kuala_Lumpur", [("Kuala Lumpur", 3.1390, 101.6869)]),
+    "Singapore": ("sea", 1, "Asia/Singapore", [("Singapore", 1.3521, 103.8198)]),
+    "Indonesia": ("sea", 1, "Asia/Jakarta", [("Jakarta", -6.2088, 106.8456)]),
+    "Thailand": ("mwl", 1, "Asia/Bangkok", [("Bangkok", 13.7563, 100.5018), ("Phuket", 7.8804, 98.3923)]),
+    "China": ("mwl", 1, "Asia/Shanghai", [("Shanghai", 31.2304, 121.4737), ("Beijing", 39.9042, 116.4074)]),
+    "Japan": ("mwl", 1, "Asia/Tokyo", [("Tokyo", 35.6762, 139.6503)]),
+    "Australia": ("mwl", 1, "Australia/Sydney", [("Sydney", -33.8688, 151.2093)]),
+}
+
+PRAYER_KEYS = ["fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha"]
+PRAYER_AR = {"fajr": "الفجر", "sunrise": "الشروق", "dhuhr": "الظهر",
+             "asr": "العصر", "maghrib": "المغرب", "isha": "العشاء"}
+PRAYER_ALERT_KEYS = ("fajr", "dhuhr", "asr", "maghrib", "isha")
+PRAYER_ALERT_SECONDS = 60
+PRAYER_ALERT_WINDOW = 120   # a prayer time is "now" for this many seconds
+
+
+def _dsin(x): return math.sin(math.radians(x))
+def _dcos(x): return math.cos(math.radians(x))
+def _dtan(x): return math.tan(math.radians(x))
+def _darcsin(x): return math.degrees(math.asin(x))
+def _darccos(x): return math.degrees(math.acos(x))
+def _darctan2(y, x): return math.degrees(math.atan2(y, x))
+def _darccot(x): return math.degrees(math.atan(1.0 / x))
+def _fix(a, b): return a - b * math.floor(a / b)
+
+
+def _sun_position(jd):
+    D = jd - 2451545.0
+    g = _fix(357.529 + 0.98560028 * D, 360)
+    q = _fix(280.459 + 0.98564736 * D, 360)
+    L = _fix(q + 1.915 * _dsin(g) + 0.020 * _dsin(2 * g), 360)
+    e = 23.439 - 0.00000036 * D
+    ra = _fix(_darctan2(_dcos(e) * _dsin(L), _dcos(L)) / 15.0, 24)
+    eqt = q / 15.0 - ra
+    decl = _darcsin(_dsin(e) * _dsin(L))
+    return decl, eqt
+
+
+def _julian(y, m, d):
+    if m <= 2:
+        y -= 1
+        m += 12
+    a = math.floor(y / 100)
+    b = 2 - a + math.floor(a / 4)
+    return math.floor(365.25 * (y + 4716)) + math.floor(30.6001 * (m + 1)) + d + b - 1524.5
+
+
+def _prayer_tz_offset(tz_name, day):
+    try:
+        from zoneinfo import ZoneInfo
+        noon = datetime(day.year, day.month, day.day, 12, tzinfo=ZoneInfo(tz_name))
+        return noon.utcoffset().total_seconds() / 3600.0
+    except Exception:
+        return 3.0
+
+
+def compute_prayer_times(day, lat, lon, tz_name, method, asr_factor=1):
+    """-> {key: datetime (naive, local wall time of that city)}"""
+    fajr_angle, isha_param = PRAYER_METHODS.get(method, PRAYER_METHODS["mwl"])
+    jd = _julian(day.year, day.month, day.day) - lon / (15.0 * 24.0)
+
+    def mid_day(t):
+        return _fix(12 - _sun_position(jd + t)[1], 24)
+
+    def angle_time(angle, t, ccw):
+        decl = _sun_position(jd + t)[0]
+        noon = mid_day(t)
+        c = (-_dsin(angle) - _dsin(decl) * _dsin(lat)) / (_dcos(decl) * _dcos(lat))
+        if c < -1 or c > 1:
+            return None                     # twilight never reaches that angle
+        tt = _darccos(c) / 15.0
+        return noon - tt if ccw else noon + tt
+
+    def asr_time(t):
+        decl = _sun_position(jd + t)[0]
+        return angle_time(-_darccot(asr_factor + _dtan(abs(lat - decl))), t, False)
+
+    t = {"fajr": 5, "sunrise": 6, "dhuhr": 12, "asr": 13, "sunset": 18, "isha": 18}
+    t = {k: v / 24.0 for k, v in t.items()}
+    r = {
+        "fajr": angle_time(fajr_angle, t["fajr"], True),
+        "sunrise": angle_time(0.833, t["sunrise"], True),
+        "dhuhr": mid_day(t["dhuhr"]),
+        "asr": asr_time(t["asr"]),
+        "sunset": angle_time(0.833, t["sunset"], False),
+        "isha": None if isinstance(isha_param, str) else angle_time(isha_param, t["isha"], False),
+    }
+    r["maghrib"] = r["sunset"]
+    if isinstance(isha_param, str):
+        r["isha"] = r["maghrib"] + int(isha_param[:-1]) / 60.0
+    # High latitudes: cap Fajr/Isha at an angle-based share of the night.
+    night = _fix(r["sunrise"] - r["sunset"], 24)
+    fp = fajr_angle / 60.0 * night
+    if r["fajr"] is None or _fix(r["sunrise"] - r["fajr"], 24) > fp:
+        r["fajr"] = r["sunrise"] - fp
+    if not isinstance(isha_param, str):
+        ip = isha_param / 60.0 * night
+        if r["isha"] is None or _fix(r["isha"] - r["sunset"], 24) > ip:
+            r["isha"] = r["sunset"] + ip
+
+    shift = _prayer_tz_offset(tz_name, day) - lon / 15.0
+    base = datetime(day.year, day.month, day.day)
+    adj = PRAYER_ADJUST.get(method, {})
+    out = {}
+    for k in PRAYER_KEYS:
+        mins = (r[k] + shift) * 60
+        if adj.get("ihtiyat"):
+            # Precautionary rounding: never early for Dhuhr..Isha, never
+            # late for Fajr/sunrise.
+            mins = math.floor(mins) if k in ("fajr", "sunrise") else math.ceil(mins - 1e-9)
+        else:
+            mins = round(mins)
+        off = adj.get(k, 0)
+        if k == "isha" and isinstance(isha_param, str):
+            off = adj.get("maghrib", 0)     # minutes-after-Maghrib Isha follows Maghrib
+        out[k] = base + timedelta(minutes=mins + off)
+    return out
+
+
+def prayer_location(cfg):
+    country = cfg.get("prayer_country", "Qatar")
+    if country not in PRAYER_COUNTRIES:
+        country = "Qatar"
+    method, asr_f, tz, cities = PRAYER_COUNTRIES[country]
+    city = next((c for c in cities if c[0] == cfg.get("prayer_city")), cities[0])
+    return country, city[0], city[1], city[2], tz, method, asr_f
+
+
+def prayer_now_local(tz):
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tz)).replace(tzinfo=None)
+    except Exception:
+        return datetime.now()
+
+
+_prayer_cache = {}
+
+
+def prayer_schedule(cfg, day=None):
+    """Today's (and tomorrow's, for after Isha) times for the chosen city."""
+    country, city, lat, lon, tz, method, asr_f = prayer_location(cfg)
+    now = prayer_now_local(tz)
+    day = day or now.date()
+    key = (country, city, day)
+    if key not in _prayer_cache:
+        if len(_prayer_cache) > 8:
+            _prayer_cache.clear()
+        _prayer_cache[key] = compute_prayer_times(day, lat, lon, tz, method, asr_f)
+    return _prayer_cache[key], now
+
+
+def next_prayer(cfg):
+    """-> (key, datetime, now) of the next prayer (sunrise skipped)."""
+    times, now = prayer_schedule(cfg)
+    for k in PRAYER_ALERT_KEYS:
+        if times[k] > now:
+            return k, times[k], now
+    tomorrow, _ = prayer_schedule(cfg, now.date() + timedelta(days=1))
+    return "fajr", tomorrow["fajr"], now
+
+
+def prayer_due(cfg):
+    """(alert id, key, time) when a prayer time has just arrived, else None."""
+    if not cfg.get("prayer_alert", True):
+        return None
+    times, now = prayer_schedule(cfg)
+    for k in PRAYER_ALERT_KEYS:
+        delta = (now - times[k]).total_seconds()
+        if 0 <= delta < PRAYER_ALERT_WINDOW:
+            return (f"{times[k]:%Y%m%d}-{k}", k, times[k])
+    return None
+
+
+def _ar_line_centered(d, cy, text, base_name, size, fill, max_w=W - 24):
+    vis, rtl = sms_truncate(d, text, base_name, size, max_w)
+    w = mixed_width(vis, font(base_name, size), size)
+    draw_sms_text(d, (W - w) / 2, (W + w) / 2, cy, vis, False, base_name, size, fill)
+
+
+HIJRI_MONTHS_AR = ["محرم", "صفر", "ربيع الأول", "ربيع الآخر", "جمادى الأولى", "جمادى الآخرة",
+                   "رجب", "شعبان", "رمضان", "شوال", "ذو القعدة", "ذو الحجة"]
+
+
+def hijri_date(d, offset=0):
+    """Tabular (civil) Islamic calendar -> (year, month, day). Can differ
+    by a day from sighting-based calendars; `offset` corrects that."""
+    jd = (d + timedelta(days=offset)).toordinal() + 1721425
+    l = jd - 1948440 + 10632
+    n = (l - 1) // 10631
+    l = l - 10631 * n + 354
+    j = ((10985 - l) // 5316) * ((50 * l) // 17719) + (l // 5670) * ((43 * l) // 15238)
+    l = l - ((30 - j) // 15) * ((17719 * j) // 50) - (j // 16) * ((15238 * j) // 43) + 29
+    m = (24 * l) // 709
+    day = l - (709 * m) // 24
+    return 30 * n + j - 30, m, day
+
+
+PRAYER_CITY_ZONE = (36, 64)
+PRAYER_HIJRI_ZONE = (64, 86)
+PRAYER_ALERT_TOGGLE = (160, 36, W, 66)
+PRAYER_ROW_TOP, PRAYER_ROW_H = 112, 29
+
+
+def panel_prayer(cfg, conn_type=None, cell_signal=None):
+    img, d = new_canvas()
+    accent = ACCENT["prayer"]
+    draw_header(d, "PRAYER", accent, conn_type, cell_signal)
+    country, city, *_ = prayer_location(cfg)
+    f_city = font("default_medium", 15)
+    d.text((14, 42), truncate_to_width(d, f"{city}  ›", f_city, 140), font=f_city, fill=FG)
+    on = cfg.get("prayer_alert", True)
+    lbl = "Alert ON" if on else "Alert OFF"
+    f_al = font("default_bold", 12)
+    lw = d.textlength(lbl, font=f_al)
+    bx1, by0 = W - 12, 41
+    d.rounded_rectangle([bx1 - lw - 16, by0, bx1, by0 + 22], radius=11,
+                        fill=accent if on else None, outline=accent if on else DIM, width=1)
+    d.text((bx1 - lw - 8, by0 + 4), lbl, font=f_al, fill=BG if on else DIM)
+
+    times, now = prayer_schedule(cfg)
+    nk, nt, _ = next_prayer(cfg)
+    mins = max(0, int((nt - now).total_seconds() // 60) + 1)
+    left = f"{mins // 60}:{mins % 60:02d}" if mins >= 60 else f"{mins} د"
+    hy, hm, hd = hijri_date(now.date(), cfg.get("hijri_offset", 0))
+    _ar_line_centered(d, 66, f"{hd} {HIJRI_MONTHS_AR[hm - 1]} {hy} هـ", "default_cn_medium", 14, FG)
+    _ar_line_centered(d, 88, f"المتبقي على {PRAYER_AR[nk]}  {left}", "default_cn_medium", 15, accent)
+
+    f_time = font("default_medium", 17)
+    for i, k in enumerate(PRAYER_KEYS):
+        y0 = PRAYER_ROW_TOP + i * PRAYER_ROW_H
+        is_next = k == nk and nt.date() == now.date()
+        if is_next:
+            d.rounded_rectangle([10, y0 + 1, W - 10, y0 + PRAYER_ROW_H - 2], radius=8, fill=(26, 44, 40))
+        color = accent if is_next else (DIM if k == "sunrise" else FG)
+        d.text((22, y0 + 6), f"{hm12(times[k])} {ampm(times[k])}", font=f_time, fill=color)
+        vis, rtl = sms_truncate(d, PRAYER_AR[k], "default_cn_medium", 16, 120)
+        draw_sms_text(d, 0, W - 22, y0 + 4, vis, True, "default_cn_medium", 16, color)
+    draw_page_dots(d, PANEL_NAMES.index("prayer"))
+    return img
+
+
+def hit_main_prayer(x, y):
+    tx0, ty0, tx1, ty1 = PRAYER_ALERT_TOGGLE
+    if tx0 <= x <= tx1 and ty0 <= y <= ty1:
+        return "alert_toggle"
+    if PRAYER_HIJRI_ZONE[0] <= y < PRAYER_HIJRI_ZONE[1]:
+        return "hijri"
+    if PRAYER_CITY_ZONE[0] <= y < PRAYER_CITY_ZONE[1]:
+        return "city"
+    return None
+
+
+def panel_prayer_country_picker(cfg, scroll_px=0):
+    items = [(c, c) for c in PRAYER_COUNTRIES]
+    return panel_scroll_picker("Country", ACCENT["prayer"], items, cfg.get("prayer_country", "Qatar"), scroll_px)
+
+
+def prayer_city_items(cfg):
+    country = cfg.get("prayer_country", "Qatar")
+    cities = PRAYER_COUNTRIES.get(country, PRAYER_COUNTRIES["Qatar"])[3]
+    return [(c[0], c[0]) for c in cities]
+
+
+def panel_prayer_city_picker(cfg, scroll_px=0):
+    return panel_scroll_picker(cfg.get("prayer_country", "Qatar"), ACCENT["prayer"],
+                               prayer_city_items(cfg), cfg.get("prayer_city", "Doha"), scroll_px)
+
+
+def panel_prayer_alert(key, when, city):
+    img, d = new_canvas()
+    accent = ACCENT["prayer"]
+    d.rectangle([0, 0, W, H], fill=(10, 30, 28))
+    # crescent
+    cx, cy, r = W / 2, 62, 26
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=accent)
+    d.ellipse([cx - r + 11, cy - r - 5, cx + r + 11, cy + r - 5], fill=(10, 30, 28))
+    _ar_line_centered(d, 112, "حان الآن موعد", "default_cn_medium", 20, FG)
+    _ar_line_centered(d, 146, ("صلاة " + PRAYER_AR[key]), "default_cn_medium", 30, accent)
+    centered_text(d, W / 2, 204, f"{hm12(when)} {ampm(when)}", font("default_bold", 26), FG)
+    centered_text(d, W / 2, 240, city, font("default_medium", 14), DIM)
+    centered_text(d, W / 2, 290, "Tap to dismiss", font("default_medium", 11), DIM)
+    return img
+
+
+def screen_wake():
+    """Turn the backlight on if it is off. -> True when we did wake it."""
+    try:
+        with open(BACKLIGHT_PATH) as f:
+            if f.read().strip() != "0":
+                return False
+        mx = "100"
+        try:
+            with open(BACKLIGHT_PATH.replace("brightness", "max_brightness")) as f:
+                mx = f.read().strip() or mx
+        except Exception:
+            pass
+        with open(BACKLIGHT_PATH, "w") as f:
+            f.write(mx)
+        _asleep_cache["ts"] = 0.0
+        return True
+    except Exception:
+        return False
+
+
+def screen_sleep():
+    try:
+        with open(BACKLIGHT_PATH, "w") as f:
+            f.write("0")
+        _asleep_cache["ts"] = 0.0
+    except Exception:
+        pass
+
+
+
 def draw_tile(d, x0, y0, x1, y1, icon_fn, label, subtitle, accent):
     d.rounded_rectangle([x0, y0, x1, y1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
     cx = (x0 + x1) / 2
@@ -3176,7 +3867,13 @@ WEATHER_CITY_ZONE = (34, 66)
 
 PICKER_TOP, PICKER_BOTTOM = 38, 316
 
-PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "openclash", "games"]
+# "tailscale" replaces "openclash" (local change; OpenClash isn't installed
+# here). Put "openclash" back in this slot to restore the original page.
+# "services" replaces "games" (local change). Put "games" back to restore.
+PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "tailscale", "services", "prayer", "power"]
+
+TS_TOGGLE_RECT = (172, 38, 218, 60)
+TS_EXIT_ZONE = (124, 180)
 
 
 # ---------- main panels ----------
@@ -3216,10 +3913,11 @@ def panel_clock(cfg, rep, conn_type=None, cell_signal=None, sms_messages=None):
     if messages:
         latest = messages[0]
         d.text((sx0 + 52, sy0 + 9), "Messages", font=font("default_bold", 14), fill=FG)
-        sub = f"{latest['from']}: {latest['body'].replace(chr(10), ' ')}"
-        f_sub = font("default_cn_medium", 11)
-        sub = truncate_to_width(d, sub, f_sub, (sx1 - sx0) - 64)
-        d.text((sx0 + 52, sy0 + 27), sub, font=f_sub, fill=DIM)
+        # Count only -- no sender or text on the home screen (user's
+        # choice: message content is read inside the Messages screen).
+        n = len(messages)
+        sub = f"{n} message" + ("" if n == 1 else "s")
+        d.text((sx0 + 52, sy0 + 27), sub, font=font("default_medium", 11), fill=DIM)
     else:
         d.text((sx0 + 52, sy0 + 9), "Messages", font=font("default_bold", 14), fill=FG)
         d.text((sx0 + 52, sy0 + 27), "No messages", font=font("default_medium", 11), fill=DIM)
@@ -3422,7 +4120,8 @@ def format_data_used(mb):
     return f"{mb:.1f} MB"
 
 
-def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_active=None, cell=None):
+def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_active=None, cell=None,
+              netmode=None):
     img, d = new_canvas()
     draw_header(d, "ACTIVE SIM", ACCENT["sim"], conn_type, cell_signal)
     country = sim["country"] or "unknown"
@@ -3495,22 +4194,63 @@ def panel_sim(cfg, sim, conn_type=None, cell_signal=None, wg_peers=None, wg_acti
         caption = "tap to set a limit"
     centered_text(d, W / 2, 228, caption, font("default_medium", 11), DIM)
 
+    # Network mode (Auto / 5G only / 4G only) in the tile WireGuard used to
+    # occupy -- WireGuard now lives on the Services page.
     wx0, wy0, wx1, wy1 = SIM_WIREGUARD_TILE
     d.rounded_rectangle([wx0, wy0, wx1, wy1], radius=10, fill=(22, 28, 40), outline=(42, 48, 60), width=1)
-    _icon_shield(d, wx0 + 24, (wy0 + wy1) / 2, 11, ACCENT["sim"])
-    peers = wg_peers or []
-    active = next((p["name"] for p in peers if p["id"] == wg_active), None)
-    d.text((wx0 + 44, wy0 + 4), "WireGuard", font=font("default_bold", 13), fill=FG)
-    if active:
-        sub = f"On · {active}"
-    elif peers:
-        sub = "Off"
-    else:
-        sub = "No configs · add in LuCI"
-    d.text((wx0 + 44, wy0 + 20), sub, font=font("default_medium", 10), fill=DIM)
+    d.text((wx0 + 10, wy0 + 4), "Network", font=font("default_bold", 12), fill=FG)
+    d.text((wx0 + 10, wy0 + 20), "mode", font=font("default_bold", 12), fill=FG)
+    sx0, sy0, sx1, sy1 = SIM_NETMODE_SEG
+    d.rounded_rectangle([sx0, sy0, sx1, sy1], radius=(sy1 - sy0) / 2, outline=ACCENT["sim"], width=1)
+    seg_w = (sx1 - sx0) / len(NETMODE_KEYS)
+    f_seg = font("default_bold", 12)
+    for i, (key, label) in enumerate(NETMODE_KEYS):
+        x0 = sx0 + i * seg_w
+        if key == netmode:
+            d.rounded_rectangle([x0 + 2, sy0 + 2, x0 + seg_w - 2, sy1 - 2], radius=(sy1 - sy0 - 4) / 2,
+                                fill=ACCENT["sim"])
+        centered_text_box(d, x0, sy0, x0 + seg_w, sy1, label, f_seg, BG if key == netmode else FG)
 
     draw_page_dots(d, 1)
     return img
+
+
+SIM_NETMODE_SEG = (88, 252, W - 22, 282)
+NETMODE_KEYS = [("AUTO", "Auto"), ("NR5G", "5G"), ("LTE", "4G")]
+NETMODE_NAMES = {"AUTO": "Auto", "NR5G": "5G only", "LTE": "4G only"}
+MUDIMODEM_RPC = "/usr/lib/oui-httpd/rpc/mudimodem"
+
+
+def get_network_mode():
+    """Current RAT preference (AUTO | NR5G | LTE) via MudiModem's own RPC,
+    which reads the modem's mode_pref directly. None if unavailable."""
+    ok, res = gl_lua_rpc(MUDIMODEM_RPC, "get_bands", {}, timeout=40)
+    if ok and isinstance(res, dict):
+        return (res.get("meta") or {}).get("mode")
+    return None
+
+
+def apply_network_mode(mode):
+    """Switch through MudiModem's set_bands, which arms its own watchdog
+    first (a change that kills the link reverts itself within 60s). Then
+    wait for real internet; keep it (confirm -> also written to GL's own
+    config, survives reboot) or revert at once. -> (ok, message)."""
+    ok, res = gl_lua_rpc(MUDIMODEM_RPC, "set_bands", {"mode": mode}, timeout=40)
+    if not ok or not isinstance(res, dict) or res.get("error"):
+        err = res.get("error") if isinstance(res, dict) else None
+        return False, f"Couldn't switch: {err}" if err else "Couldn't switch network mode"
+    time.sleep(5)
+    t0, up = time.time(), False
+    while time.time() - t0 < 45:
+        if subprocess.run(["ping", "-c", "1", "-W", "2", "8.8.8.8"], capture_output=True).returncode == 0:
+            up = True
+            break
+        time.sleep(2)
+    if up:
+        gl_lua_rpc(MUDIMODEM_RPC, "confirm", {}, timeout=40)
+        return True, None
+    gl_lua_rpc(MUDIMODEM_RPC, "revert_now", {}, timeout=40)
+    return False, f"No internet on {NETMODE_NAMES.get(mode, mode)} -- reverted"
 
 
 def panel_openclash(oc, traf, conn_type=None, cell_signal=None):
@@ -3593,6 +4333,512 @@ def openclash_status_text(oc):
     if enabled:
         return "Enabled, but not running", (230, 170, 90)
     return "Stopped", DIM
+
+
+# ---------- Tailscale (local addition) ----------
+#
+# Driven through GL's own Lua RPC (tailscale.set_config) -- the same call
+# the web UI's Tailscale page makes -- so gl_tailscale (with its
+# --login-server edit) and the kill-switch hook run exactly as they do
+# from the web UI. One call carries all four steps: enable, custom exit
+# node + its IP, and IP masquerading (plus subnet advertisement).
+
+_GL_TS_RPC = "/usr/lib/oui-httpd/rpc/tailscale"
+TS_OK = (110, 220, 150)
+TS_BAD = (240, 110, 110)
+TS_WARN = (230, 170, 90)
+
+
+def tailscale_installed():
+    return os.path.exists("/usr/sbin/tailscale") and os.path.exists(_GL_TS_RPC)
+
+
+def tailscale_status_empty(installed=False):
+    return {"installed": installed, "enabled": False, "state": None, "ip": None,
+            "exit_cfg": "", "exit_active": None, "masq": False, "lan": False, "wan": False,
+            "peers": [], "online": 0}
+
+
+def get_tailscale_status():
+    if not tailscale_installed():
+        return tailscale_status_empty()
+    st = tailscale_status_empty(True)
+    st["enabled"] = uci_get("tailscale.settings.enabled") == "1"
+    st["exit_cfg"] = uci_get("tailscale.settings.exit_node_ip")
+    st["masq"] = uci_get("tailscale.settings.masq") == "1"
+    st["lan"] = uci_get("tailscale.settings.lan_enabled") == "1"
+    st["wan"] = uci_get("tailscale.settings.wan_enabled") == "1"
+    ok, out = run_checked(["/usr/sbin/tailscale", "status", "--json"], timeout=6)
+    if not ok or not out:
+        return st
+    try:
+        data = json.loads(out)
+    except Exception:
+        return st
+    st["state"] = data.get("BackendState")
+    ips = (data.get("Self") or {}).get("TailscaleIPs") or []
+    st["ip"] = next((a for a in ips if "." in a), None)
+    peers = []
+    for p in (data.get("Peer") or {}).values():
+        pips = p.get("TailscaleIPs") or []
+        ip4 = next((a for a in pips if "." in a), None)
+        if not ip4:
+            continue
+        name = p.get("HostName") or (p.get("DNSName") or "").split(".")[0] or ip4
+        peers.append({"name": name, "ip": ip4, "online": bool(p.get("Online")),
+                      "exit_option": bool(p.get("ExitNodeOption")), "exit": bool(p.get("ExitNode"))})
+        if p.get("ExitNode"):
+            st["exit_active"] = ip4
+    peers.sort(key=lambda p: (not p["online"], p["name"].lower()))
+    st["peers"] = peers
+    st["online"] = sum(1 for p in peers if p["online"])
+    return st
+
+
+def tailscale_exit_name(ip, ts, cfg):
+    if not ip:
+        return None
+    for p in ts.get("peers") or []:
+        if p["ip"] == ip:
+            return p["name"]
+    for name, cip in cfg.get("ts_exit_cache") or []:
+        if cip == ip:
+            return name
+    return None
+
+
+def remember_tailscale_exit_nodes(ts, cfg):
+    """Keep the exit-capable peers seen while connected, so the picker can
+    still offer them while Tailscale is off (no daemon to ask then).
+    Returns True when cfg changed and should be saved."""
+    seen = [[p["name"], p["ip"]] for p in ts.get("peers") or [] if p["exit_option"]]
+    if seen and seen != cfg.get("ts_exit_cache"):
+        cfg["ts_exit_cache"] = seen
+        return True
+    return False
+
+
+_TS_PIN_TAG = "# ts-derp-pin (dashboard)"
+
+
+def _ts_login_host():
+    """Host of the self-hosted control server (= its embedded DERP), taken
+    from the --login-server edit in /usr/bin/gl_tailscale."""
+    try:
+        m = re.search(r"--login-server=https?://([^/\s:]+)", Path("/usr/bin/gl_tailscale").read_text())
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _is_public_ipv4(ip):
+    try:
+        a = [int(x) for x in ip.split(".")]
+    except Exception:
+        return False
+    if len(a) != 4 or any(x < 0 or x > 255 for x in a):
+        return False
+    return not (a[0] in (0, 10, 127) or a[0] >= 224 or (a[0] == 100 and 64 <= a[1] <= 127)
+                or (a[0] == 169 and a[1] == 254) or (a[0] == 172 and 16 <= a[1] <= 31)
+                or (a[0] == 192 and a[1] == 168))
+
+
+def pin_tailscale_derp_host():
+    """The DERP relay is reached by hostname (dynamic home IP, so no fixed
+    IP in the DERP map). The router resolves it through the carrier's DNS
+    (10.x), and once the exit-node route is up that lookup itself goes into
+    the not-yet-working tunnel -- DERP never connects and there's no
+    internet (seen in the log as "connect to region 999 ... context
+    deadline exceeded"). Resolve it now, while traffic is still direct,
+    via a public resolver, and pin it in /etc/hosts (Go's resolver reads
+    it first). Re-done on every "on", so a changed home IP is picked up.
+    Returns the pinned IP or None (old pin, if any, is then left alone)."""
+    host = _ts_login_host()
+    if not host:
+        return None
+    ip = None
+    for server in ("1.1.1.1", "8.8.8.8"):
+        ok, out = run_checked(["nslookup", host, server], timeout=6)
+        if not ok:
+            continue
+        after_name = False
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Name:"):
+                after_name = True
+            elif after_name and line.startswith("Address:"):
+                cand = line.split(":", 1)[1].strip()
+                if _is_public_ipv4(cand):
+                    ip = cand
+                    break
+        if ip:
+            break
+    if not ip:
+        return None
+    try:
+        hosts = Path("/etc/hosts")
+        lines = [l for l in hosts.read_text().splitlines()
+                 if _TS_PIN_TAG not in l and not re.search(rf"\s{re.escape(host)}(\s|$)", l)]
+        lines.append(f"{ip} {host} {_TS_PIN_TAG}")
+        tmp = hosts.with_name("hosts.tsdash.tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        os.replace(tmp, hosts)
+        run(["killall", "-HUP", "dnsmasq"])
+    except Exception:
+        return None
+    return ip
+
+
+def set_tailscale(on, cfg, exit_ip=None):
+    """(ok, err). On: enable + saved exit node + masquerading + subnet
+    advertisement in a single set_config. Off: the same shape GL's web UI
+    leaves behind when switched off (everything cleared), so the web UI and
+    kill switch see a state they already know."""
+    if on:
+        pin_tailscale_derp_host()
+        params = {"enabled": True,
+                  "lan_enabled": bool(cfg.get("ts_lan", True)),
+                  "wan_enabled": bool(cfg.get("ts_wan", True)),
+                  "exit_node_ip": exit_ip if exit_ip is not None else (cfg.get("ts_exit_node") or ""),
+                  "run_exit_node": False,
+                  "masq": bool(cfg.get("ts_masq", True))}
+    else:
+        params = {"enabled": False, "lan_enabled": False, "wan_enabled": False,
+                  "exit_node_ip": "", "run_exit_node": False, "masq": False}
+    ok, res = gl_lua_rpc(_GL_TS_RPC, "set_config", params, timeout=90)
+    if not ok:
+        msg = res.get("err_msg") if isinstance(res, dict) else None
+        return False, msg or "Tailscale settings call failed"
+    return True, None
+
+
+def tailscale_steps(ts, cfg):
+    """The four things "on" must leave true, each checked against what's
+    really there: (label, ok)."""
+    want_exit = cfg.get("ts_exit_node") or ""
+    running = ts["enabled"] and ts["state"] == "Running"
+    return [
+        ("Tailscale on", running),
+        ("Custom exit node", bool(ts["exit_cfg"])),
+        ("Exit node in use", bool(want_exit) and ts["exit_active"] == want_exit),
+        ("IP masquerading", ts["masq"]),
+    ]
+
+
+def wait_for_tailscale(want_on, cfg, timeout=45.0, poll=1.5):
+    t0 = time.time()
+    ts = get_tailscale_status()
+    while time.time() - t0 < timeout:
+        if want_on and all(ok for _, ok in tailscale_steps(ts, cfg)):
+            return True, ts
+        if not want_on and not ts["enabled"] and ts["state"] != "Running":
+            return True, ts
+        time.sleep(poll)
+        ts = get_tailscale_status()
+    return False, ts
+
+
+def tailscale_status_text(ts):
+    if not ts["enabled"]:
+        return "Off", DIM
+    state = ts["state"]
+    if state == "Running":
+        return "Connected", TS_OK
+    if state in ("NeedsLogin", "NeedsMachineAuth"):
+        return "Needs login -- use the web UI", TS_WARN
+    return "Connecting…", DIM
+
+
+def _draw_step_mark(d, x, y, ok):
+    """Small drawn tick / cross (no font glyph needed)."""
+    if ok:
+        d.ellipse([x, y, x + 13, y + 13], fill=TS_OK)
+        d.line([x + 3, y + 7, x + 6, y + 10, x + 10, y + 3], fill=BG, width=2)
+    else:
+        d.ellipse([x, y, x + 13, y + 13], outline=TS_BAD, width=2)
+        d.line([x + 4, y + 4, x + 9, y + 9], fill=TS_BAD, width=2)
+        d.line([x + 9, y + 4, x + 4, y + 9], fill=TS_BAD, width=2)
+
+
+def panel_tailscale(ts, cfg, conn_type=None, cell_signal=None):
+    acc = ACCENT["tailscale"]
+    img, d = new_canvas()
+    draw_header(d, "TAILSCALE", acc, conn_type, cell_signal)
+    idx = PANEL_NAMES.index("tailscale")
+
+    if not ts["installed"]:
+        centered_text(d, W / 2, 130, "Tailscale isn't installed", font("default_medium", 14), DIM)
+        draw_page_dots(d, idx)
+        return img
+
+    d.text((16, 39), "Tailscale", font=font("default_medium", 16), fill=FG)
+    status, status_color = tailscale_status_text(ts)
+    d.text((16, 58), status, font=font("default_medium", 11), fill=status_color)
+    tx0, ty0, tx1, ty1 = TS_TOGGLE_RECT
+    draw_toggle(d, tx0, ty0, ts["enabled"], acc, w=tx1 - tx0, h=ty1 - ty0)
+
+    d.line([16, 74, W - 16, 74], fill=(40, 44, 54))
+
+    d.text((16, 80), "This router", font=font("default_medium", 13), fill=DIM)
+    online = f"{ts['online']} online" if ts["state"] == "Running" else ""
+    if online:
+        f_on = font("default_medium", 12)
+        d.text((W - 16 - d.textlength(online, font=f_on), 81), online, font=f_on, fill=DIM)
+    d.text((16, 98), ts["ip"] or "—", font=font("default_mono_medium", 17),
+           fill=FG if ts["ip"] else DIM)
+
+    d.line([16, TS_EXIT_ZONE[0], W - 16, TS_EXIT_ZONE[0]], fill=(40, 44, 54))
+
+    d.text((16, 130), "Exit node  ›", font=font("default_medium", 14), fill=DIM)
+    want = cfg.get("ts_exit_node") or ""
+    name = tailscale_exit_name(want, ts, cfg)
+    if want:
+        f_name = font("default_bold", 16)
+        d.text((16, 150), truncate_to_width(d, name or want, f_name, W - 32), font=f_name, fill=FG)
+        if name:
+            f_ip = font("default_mono_medium", 12)
+            d.text((W - 16 - d.textlength(want, font=f_ip), 134), want, font=f_ip, fill=DIM)
+    else:
+        d.text((16, 152), "none -- tap to choose", font=font("default_medium", 13), fill=DIM)
+
+    d.line([16, TS_EXIT_ZONE[1], W - 16, TS_EXIT_ZONE[1]], fill=(40, 44, 54))
+
+    f_step = font("default_medium", 13)
+    y = 190
+    for label, ok in tailscale_steps(ts, cfg):
+        if ts["enabled"]:
+            _draw_step_mark(d, 16, y + 2, ok)
+            d.text((38, y), label, font=f_step, fill=FG if ok else TS_BAD)
+        else:
+            d.ellipse([16, y + 2, 29, y + 15], outline=(60, 66, 80), width=2)
+            d.text((38, y), label, font=f_step, fill=DIM)
+        y += 22
+
+    draw_page_dots(d, idx)
+    return img
+
+
+def tailscale_exit_items(ts, cfg):
+    """(ip, label) for the picker: live exit-capable peers when connected,
+    else the cached list; the saved choice is always present."""
+    live = [[p["name"], p["ip"]] for p in ts.get("peers") or [] if p["exit_option"]]
+    pairs = live or [list(x) for x in (cfg.get("ts_exit_cache") or [])]
+    want = cfg.get("ts_exit_node") or ""
+    if want and all(ip != want for _, ip in pairs):
+        pairs.append([tailscale_exit_name(want, ts, cfg) or want, want])
+    return [(ip, f"{name} · {ip}" if name != ip else ip) for name, ip in pairs]
+
+
+def panel_ts_exit_picker(ts, cfg, scroll_px=0):
+    items = tailscale_exit_items(ts, cfg)
+    if not items:
+        img, d = new_canvas()
+        draw_back_header(d, "Exit node", ACCENT["tailscale"])
+        centered_text(d, W / 2, 140, "No exit nodes seen yet --", font("default_medium", 13), DIM)
+        centered_text(d, W / 2, 160, "turn Tailscale on once", font("default_medium", 13), DIM)
+        return img
+    return panel_scroll_picker("Exit node", ACCENT["tailscale"], items,
+                               cfg.get("ts_exit_node") or "", scroll_px)
+
+
+# ---------- Services page (local addition) ----------
+#
+# AdGuard Home, WireGuard client, ZeroTier and Tor, each switched through
+# GL's own RPC (the web UI's code path). ZeroTier/Tor/AdGuard calls carry
+# the current values of every other field back unchanged -- only the
+# on/off flag is ever changed (the ZeroTier network ID is never touched).
+
+_GL_RPC_DIR = "/usr/lib/oui-httpd/rpc"
+SVC_KEYS = ["adguard", "wg", "zt", "tor"]
+SVC_LABELS = {"adguard": "AdGuard Home", "wg": "WireGuard", "zt": "ZeroTier", "tor": "Tor"}
+SVC_CARD_TOP, SVC_CARD_H, SVC_CARD_GAP = 40, 58, 5
+
+
+def _svc_card_y(i):
+    return SVC_CARD_TOP + i * (SVC_CARD_H + SVC_CARD_GAP)
+
+
+def _svc_toggle_rect(i):
+    y0 = _svc_card_y(i)
+    return (172, y0 + 15, 218, y0 + 37)
+
+
+def services_status_empty():
+    return {"adguard": {"on": False, "running": False},
+            "zt": {"on": False, "ip": None, "running": False},
+            "tor": {"on": False, "status": 0, "percent": None}}
+
+
+def _zerotier_ip():
+    ok, out = run_checked(["zerotier-cli", "listnetworks"], timeout=4)
+    if not ok:
+        return None
+    for line in out.splitlines()[1:]:
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)/\d+", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def get_services_status():
+    st = services_status_empty()
+    st["adguard"]["on"] = uci_get("adguardhome.config.enabled") == "1"
+    st["adguard"]["running"] = run_checked(["pgrep", "-f", "AdGuardHome"])[0]
+    st["zt"]["on"] = uci_get("zerotier.gl.enabled") == "1"
+    if st["zt"]["on"]:
+        st["zt"]["running"] = run_checked(["pgrep", "zerotier-one"])[0]
+        st["zt"]["ip"] = _zerotier_ip()
+    st["tor"]["on"] = uci_get("tor.global.enable") == "1"
+    if st["tor"]["on"]:
+        ok, res = gl_lua_rpc(f"{_GL_RPC_DIR}/tor", "get_status", {}, timeout=10)
+        if ok and isinstance(res, dict):
+            try:
+                st["tor"]["status"] = int(res.get("status") or 0)
+            except Exception:
+                pass
+            m = re.search(r"(\d+)%", str(res.get("log") or ""))
+            st["tor"]["percent"] = int(m.group(1)) if m else None
+    return st
+
+
+def services_wg_peer(cfg, wg_peers, wg_active):
+    """Peer the WireGuard toggle uses: the connected one, else the last one
+    used from this page, else the first saved peer."""
+    if wg_active:
+        return wg_active
+    ids = [p["id"] for p in wg_peers or []]
+    last = cfg.get("svc_wg_peer")
+    if last in ids:
+        return last
+    return ids[0] if ids else None
+
+
+def service_on(key, svc, wg_active):
+    if key == "wg":
+        return bool(wg_active)
+    return bool(svc[key]["on"])
+
+
+def service_status_line(key, svc, cfg, wg_peers, wg_active):
+    if key == "adguard":
+        a = svc["adguard"]
+        if a["on"]:
+            return ("Running", TS_OK) if a["running"] else ("Starting…", DIM)
+        return "Off", DIM
+    if key == "wg":
+        names = {p["id"]: p["name"] for p in wg_peers or []}
+        if wg_active:
+            return f"Connected · {names.get(wg_active, wg_active)}", TS_OK
+        peer = services_wg_peer(cfg, wg_peers, wg_active)
+        return (f"Off · {names.get(peer, peer)}  ›", DIM) if peer else ("No server saved", DIM)
+    if key == "zt":
+        z = svc["zt"]
+        if not z["on"]:
+            return "Off", DIM
+        return (f"Online · {z['ip']}", TS_OK) if z["ip"] else ("Connecting…", DIM)
+    t = svc["tor"]
+    if not t["on"]:
+        return "Off", DIM
+    if t["status"] == 1:
+        return "Connected", TS_OK
+    pct = f" {t['percent']}%" if t["percent"] is not None else ""
+    return f"Connecting…{pct}", DIM
+
+
+def panel_services(svc, cfg, wg_peers, wg_active, conn_type=None, cell_signal=None):
+    acc = ACCENT["services"]
+    img, d = new_canvas()
+    draw_header(d, "SERVICES", acc, conn_type, cell_signal)
+    f_name = font("default_bold", 16)
+    f_status = font("default_medium", 11)
+    for i, key in enumerate(SVC_KEYS):
+        y0 = _svc_card_y(i)
+        d.rounded_rectangle([12, y0, W - 12, y0 + SVC_CARD_H], radius=10,
+                            fill=(18, 28, 46), outline=(44, 56, 78), width=1)
+        d.text((24, y0 + 9), SVC_LABELS[key], font=f_name, fill=FG)
+        status, color = service_status_line(key, svc, cfg, wg_peers, wg_active)
+        d.text((24, y0 + 33), truncate_to_width(d, status, f_status, 140), font=f_status, fill=color)
+        tx0, ty0, tx1, ty1 = _svc_toggle_rect(i)
+        draw_toggle(d, tx0, ty0, service_on(key, svc, wg_active), acc, w=tx1 - tx0, h=ty1 - ty0)
+    draw_page_dots(d, PANEL_NAMES.index("services"))
+    return img
+
+
+def hit_main_services(x, y):
+    for i, key in enumerate(SVC_KEYS):
+        y0 = _svc_card_y(i)
+        if y0 <= y <= y0 + SVC_CARD_H:
+            if x >= 150:
+                return f"svc_toggle:{key}"
+            if key == "wg":
+                return "wg_pick"
+            return None
+    return None
+
+
+def set_service(key, want, cfg, wg_peers, wg_active):
+    """(ok, err). Issues the change through GL's RPC and waits for it to
+    take; WireGuard reuses the SIM page's AutoVPN path."""
+    if key == "adguard":
+        ok, cur = gl_lua_rpc(f"{_GL_RPC_DIR}/adguardhome", "get_config", {})
+        params = {"enabled": want, "dns_enabled": bool((cur or {}).get("dns_enabled", True))}
+        ok, res = gl_lua_rpc(f"{_GL_RPC_DIR}/adguardhome", "set_config", params, timeout=60)
+        if not ok:
+            return False, (res or {}).get("err_msg") or "AdGuard Home call failed"
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            if run_checked(["pgrep", "-f", "AdGuardHome"])[0] == want:
+                return True, None
+            time.sleep(1)
+        return False, "AdGuard Home didn't " + ("start" if want else "stop") + " in time"
+    if key == "zt":
+        ok, cur = gl_lua_rpc(f"{_GL_RPC_DIR}/zerotier", "get_config", {})
+        if not ok or not isinstance(cur, dict):
+            return False, "Couldn't read ZeroTier settings"
+        params = {"enabled": want,
+                  "lan_enabled": bool(cur.get("lan_enabled")),
+                  "wan_enabled": bool(cur.get("wan_enabled"))}
+        if cur.get("id"):
+            params["id"] = cur["id"]
+        ok, res = gl_lua_rpc(f"{_GL_RPC_DIR}/zerotier", "set_config", params, timeout=60)
+        if not ok:
+            return False, (res or {}).get("err_msg") or "ZeroTier call failed"
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            on = uci_get("zerotier.gl.enabled") == "1"
+            if on == want and (not want or _zerotier_ip()):
+                return True, None
+            time.sleep(1.5)
+        return (False, "ZeroTier started but has no address yet") if want else (False, "ZeroTier still on")
+    if key == "tor":
+        ok, res = gl_lua_rpc(f"{_GL_RPC_DIR}/tor", "set_config", {"enable": want}, timeout=90)
+        if not ok:
+            return False, (res or {}).get("err_msg") or "Tor call failed"
+        return True, None   # Tor bootstraps for a minute or more; the card shows progress
+    if key == "wg":
+        peer = services_wg_peer(cfg, wg_peers, wg_active)
+        if not peer:
+            return False, "No WireGuard server saved"
+        if not set_wireguard_enabled(peer, want):
+            return False, "Couldn't change the WireGuard rule"
+        got = wait_for_wireguard_state(peer if want else None)
+        if want and got == peer:
+            cfg["svc_wg_peer"] = peer
+            save_config(cfg)
+            return True, None
+        if not want and got is None:
+            return True, None
+        return False, "WireGuard didn't " + ("connect" if want else "disconnect") + " in time"
+    return False, "Unknown service"
+
+
+def hit_main_tailscale(x, y):
+    tx0, ty0, tx1, ty1 = TS_TOGGLE_RECT
+    if tx0 - 10 <= x <= tx1 + 10 and ty0 - 8 <= y <= ty1 + 8:
+        return "toggle"
+    if TS_EXIT_ZONE[0] <= y < TS_EXIT_ZONE[1]:
+        return "exit"
+    return None
 
 
 MONITOR_CPU_BAR = (16, 144, W - 16, 158)
@@ -4020,6 +5266,66 @@ def panel_confirm(title, message, accent, yes_label="Yes", danger=False):
     return img
 
 
+# Power menu, opened by holding the power/home button (see the
+# SWITCH_REQUEST_FILE handling in mode_live).
+POWER_MENU_ITEMS = [("shutdown", "Shut down", True), ("reboot", "Reboot", False),
+                    ("stock", "Exit dashboard", False), ("cancel", "Cancel", None)]
+POWER_MENU_TOP, POWER_MENU_H, POWER_MENU_GAP = 70, 44, 12
+
+
+def panel_power_menu():
+    img, d = new_canvas()
+    draw_back_header(d, "Power", ACCENT["clock"])
+    f = font("default_bold", 15)
+    for i, (key, label, danger) in enumerate(POWER_MENU_ITEMS):
+        y0 = POWER_MENU_TOP + i * (POWER_MENU_H + POWER_MENU_GAP)
+        box = [24, y0, W - 24, y0 + POWER_MENU_H]
+        if danger is True:
+            d.rounded_rectangle(box, radius=10, fill=(200, 80, 80))
+            centered_text_box(d, *box, label, f, BG)
+        elif danger is False:
+            d.rounded_rectangle(box, radius=10, fill=(22, 28, 40), outline=ACCENT["clock"], width=2)
+            centered_text_box(d, *box, label, f, FG)
+        else:
+            d.rounded_rectangle(box, radius=10, outline=DIM, width=2)
+            centered_text_box(d, *box, label, font("default_medium", 15), DIM)
+    return img
+
+
+POWER_BTN_C, POWER_BTN_R = (W / 2, 150), 62
+
+
+def panel_power_page(conn_type=None, cell_signal=None):
+    img, d = new_canvas()
+    accent = ACCENT["power"]
+    draw_header(d, "POWER", accent, conn_type, cell_signal)
+    cx, cy = POWER_BTN_C
+    r = POWER_BTN_R
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(60, 22, 28), outline=accent, width=4)
+    # the power symbol: an open ring with a bar through the gap
+    ir = 30
+    d.arc([cx - ir, cy - ir, cx + ir, cy + ir], start=-60, end=240, fill=accent, width=7)
+    d.line([cx, cy - ir - 6, cx, cy + 2], fill=accent, width=7)
+    centered_text(d, cx, cy + r + 18, "Tap for power options", font("default_medium", 13), DIM)
+    draw_page_dots(d, PANEL_NAMES.index("power"))
+    return img
+
+
+def hit_main_power(x, y):
+    cx, cy = POWER_BTN_C
+    return "button" if (x - cx) ** 2 + (y - cy) ** 2 <= (POWER_BTN_R + 12) ** 2 else None
+
+
+def hit_power_menu(x, y):
+    if not (24 <= x <= W - 24):
+        return None
+    for i, (key, _, _) in enumerate(POWER_MENU_ITEMS):
+        y0 = POWER_MENU_TOP + i * (POWER_MENU_H + POWER_MENU_GAP)
+        if y0 <= y <= y0 + POWER_MENU_H:
+            return key
+    return None
+
+
 def hit_confirm(x, y):
     yx0, yy0, yx1, yy1 = CONFIRM_YES_RECT
     if yx0 <= x <= yx1 and yy0 <= y <= yy1:
@@ -4231,11 +5537,11 @@ def panel_sms(messages, scroll_px=0):
         if y0 + SMS_ROW_H < 0 or y0 > list_h:
             continue
         ld.text((16, y0 + 6), msg["from"], font=f_sender, fill=FG)
-        when = msg["sent"].strftime("%d %b %H:%M") if msg["sent"] else ""
+        when = (msg["sent"].strftime("%d %b ") + hm12(msg["sent"]) + " " + ampm(msg["sent"])) if msg["sent"] else ""
         wbbox = ld.textbbox((0, 0), when, font=f_time)
         ld.text((W - 16 - (wbbox[2] - wbbox[0]), y0 + 9), when, font=f_time, fill=DIM)
-        preview = truncate_to_width(ld, msg["body"].replace("\n", " "), f_body, W - 32)
-        ld.text((16, y0 + 27), preview, font=f_body, fill=DIM)
+        vis, rtl = sms_truncate(ld, msg["body"].replace("\n", " "), "default_cn_medium", 12, W - 32)
+        draw_sms_text(ld, 16, W - 16, y0 + 27, vis, rtl, "default_cn_medium", 12, DIM)
         if i > 0:
             ld.line([16, y0, W - 16, y0], fill=(28, 32, 42))
     img.paste(list_img, (0, SMS_LIST_TOP))
@@ -4263,18 +5569,51 @@ def hit_sms(y, n_messages, scroll_px=0):
 def panel_sms_detail(msg):
     img, d = new_canvas()
     draw_back_header(d, msg["from"], ACCENT["clock"])
-    when = msg["sent"].strftime("%a %d %b %Y, %H:%M") if msg["sent"] else msg.get("sent_raw", "")
+    when = (msg["sent"].strftime("%a %d %b %Y, ") + hm12(msg["sent"]) + " " + ampm(msg["sent"])) if msg["sent"] else msg.get("sent_raw", "")
     centered_text(d, W / 2, 40, when, font("default_medium", 12), DIM)
     d.line([16, 62, W - 16, 62], fill=(40, 44, 54))
 
-    f = font("default_cn_medium", 15)
     y = 74
-    for line in wrap_text_to_lines(d, msg["body"], f, W - 32):
-        if y > H - 22:
+    room = SMS_DELETE_RECT[1] - 6 - y
+    arabic = has_arabic(msg["body"])
+    # Shrink the text a step at a time until the whole message fits above
+    # the Delete button (there is no scrolling on this screen).
+    for size in (15, 14, 13, 12, 11):
+        step = size + (9 if arabic else 7)
+        lines = sms_wrap(d, msg["body"], "default_cn_medium", size, W - 32)
+        if len(lines) * step <= room:
             break
-        d.text((16, y), line, font=f, fill=FG)
-        y += 22
+    for vis, rtl in lines:
+        if y + step > SMS_DELETE_RECT[1] - 2:
+            break
+        draw_sms_text(d, 16, W - 16, y, vis, rtl, "default_cn_medium", size, FG)
+        y += step
+    if msg.get("path"):
+        x0, y0, x1, y1 = SMS_DELETE_RECT
+        d.rounded_rectangle([x0, y0, x1, y1], radius=(y1 - y0) / 2, outline=(220, 90, 90), width=2)
+        centered_text_box(d, x0, y0, x1, y1, "Delete", font("default_bold", 13), (230, 110, 110))
     return img
+
+
+SMS_DELETE_RECT = (70, H - 38, W - 70, H - 10)
+
+
+def hit_sms_delete(x, y):
+    x0, y0, x1, y1 = SMS_DELETE_RECT
+    return x0 - 8 <= x <= x1 + 8 and y0 - 6 <= y <= y1 + 6
+
+
+def delete_sms_file(path):
+    """Remove one message from the smstools spool -- GL's web UI lists the
+    same spool, so it disappears there too. Only paths inside the spool."""
+    try:
+        p = Path(path).resolve()
+        if not any(str(p).startswith(dd + "/") for dd in SMS_SPOOL_DIRS):
+            return False
+        p.unlink()
+        return True
+    except Exception:
+        return False
 
 
 # ---------- WireGuard ----------
@@ -5361,7 +6700,12 @@ def hit_main_sim(x, y):
         return "data_toggle" if x < (dx1 + rx0) / 2 else "roam_toggle"
     wx0, wy0, wx1, wy1 = SIM_WIREGUARD_TILE
     if wx0 <= x <= wx1 and wy0 <= y <= wy1:
-        return "wireguard"
+        sx0, _, sx1, _ = SIM_NETMODE_SEG
+        if x >= sx0 - 6:
+            seg_w = (sx1 - sx0) / len(NETMODE_KEYS)
+            idx = min(len(NETMODE_KEYS) - 1, max(0, int((x - sx0) / seg_w)))
+            return f"netmode:{NETMODE_KEYS[idx][0]}"
+        return None
     if 156 <= y < wy0:
         return "data_cap"
     return None
@@ -5498,6 +6842,9 @@ def mode_preview(outdir):
                                             "up": 41.3, "bytes": 205e6, "error": None, "via": conn_type})),
         ("fx", panel_fx(cfg, fx, "month", conn_type, cell_signal)),
         ("openclash", panel_openclash(oc, traf, conn_type, cell_signal)),
+        ("tailscale", panel_tailscale(get_tailscale_status(), cfg, conn_type, cell_signal)),
+        ("ts_exit", panel_ts_exit_picker(get_tailscale_status(), cfg)),
+        ("services", panel_services(get_services_status(), cfg, wg_peers, wg_active, conn_type, cell_signal)),
         ("city_top", panel_city_picker("top", cfg)),
         ("city_bottom", panel_city_picker("bottom", cfg)),
         ("fx_top_from", panel_currency_picker("top", "from", cfg)),
@@ -5759,6 +7106,9 @@ def mode_live():
     # OpenClash also gets started/stopped from LuCI or the GL app.
     refresher.add("oc", get_openclash_status, 10)
     refresher.add("traf", get_openclash_traffic_and_node, 20)
+    # Local daemon socket + uci only -- never touches the modem.
+    refresher.add("ts", get_tailscale_status, 10)
+    refresher.add("svc", get_services_status, 15)
     refresher.add("wx", lambda: fetch_weather(cfg["weather_city"]), 1800)
     refresher.add("aq", lambda: fetch_air_quality(cfg["weather_city"]), 1800)
     refresher.add("sms", get_sms_messages, 15)
@@ -5780,6 +7130,8 @@ def mode_live():
     # 5s, not 20s: signal, network type and aggregated bands are now shown
     # live on the SIM page, and one pass is two ubus calls (~0.1s total).
     refresher.add("cell", _get_active_cell_info, 5)
+    # Rare on purpose: each read is several AT commands through the modem.
+    refresher.add("netmode", get_network_mode, 300)
     refresher.start()
 
     # Seeded from cache/defaults so the first frame draws immediately
@@ -5790,10 +7142,13 @@ def mode_live():
            "iccid": None, "attached": False, "roaming": False, "carrier": None, "airplane": False}
     oc = openclash_status_empty(openclash_installed())
     traf = openclash_traffic_empty()
+    ts = tailscale_status_empty(tailscale_installed())
+    svc = services_status_empty()
     wx, aq = [], []
     sms_messages = []
     wg_peers, wg_active = [], None
     wg_filter_country = None
+    netmode = None
     rep = {"connected": False, "ssid": None, "signal": None, "ip": None}
 
     net_sample, net_down, net_up = None, None, None
@@ -5838,11 +7193,19 @@ def mode_live():
         elif name == "fx":
             return panel_fx(cfg, fx, fx_range, conn_type, cell_signal)
         elif name == "sim":
-            return panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, cell_info)
+            return panel_sim(cfg, sim, conn_type, cell_signal, wg_peers, wg_active, cell_info, netmode)
         elif name == "openclash":
             return panel_openclash(oc, traf, conn_type, cell_signal)
+        elif name == "tailscale":
+            return panel_tailscale(ts, cfg, conn_type, cell_signal)
+        elif name == "services":
+            return panel_services(svc, cfg, wg_peers, wg_active, conn_type, cell_signal)
         elif name == "weather":
             return panel_weather(cfg, wx, conn_type, cell_signal)
+        elif name == "prayer":
+            return panel_prayer(cfg, conn_type, cell_signal)
+        elif name == "power":
+            return panel_power_page(conn_type, cell_signal)
         elif name == "games":
             return panel_games(game_scores)
         else:
@@ -6265,11 +7628,126 @@ def mode_live():
         return action.startswith("oc_")
 
     def confirm_accent():
-        if is_sim_toggle_action(confirm_action):
+        if is_sim_toggle_action(confirm_action) or confirm_action.startswith("netmode:"):
             return ACCENT["sim"]
         if is_openclash_action(confirm_action):
             return ACCENT["openclash"]
+        if is_tailscale_action(confirm_action):
+            return ACCENT["tailscale"]
+        if is_service_action(confirm_action):
+            return ACCENT["services"]
         return ACCENT["clock"]
+
+    def is_service_action(action):
+        return action.startswith("svc_")
+
+    def services_confirm(key):
+        """Every service switch asks first. Returns a notice instead when
+        there's nothing to switch (no WireGuard server saved)."""
+        nonlocal confirm_title, confirm_message, confirm_yes_label, confirm_action
+        nonlocal confirm_return_view, confirm_danger
+        want = not service_on(key, svc, wg_active)
+        label = SVC_LABELS[key]
+        if key == "wg" and not services_wg_peer(cfg, wg_peers, wg_active):
+            return "No WireGuard server saved -- add one in the web UI"
+        ts_exit_on = ts.get("enabled") and bool(ts.get("exit_cfg"))
+        conflict = (" Tailscale's exit node is on -- running both will conflict."
+                    if want and ts_exit_on and key in ("wg", "tor") else "")
+        if want:
+            extra = {"adguard": "DNS for every device will go through AdGuard.",
+                     "wg": "All traffic will go through the WireGuard server.",
+                     "zt": "Joins your ZeroTier network (network ID unchanged).",
+                     "tor": "All traffic will go through Tor; connecting takes a minute or more."}[key]
+            confirm_message = f"Turn {label} on? {extra}{conflict}"
+            confirm_yes_label = "Turn on"
+        else:
+            confirm_message = f"Turn {label} off?"
+            confirm_yes_label = "Turn off"
+        confirm_title = label
+        confirm_action = f"svc_{key}:{'on' if want else 'off'}"
+        confirm_danger = not want
+        confirm_return_view = "main"
+        return None
+
+    def run_service_action(action):
+        nonlocal svc, wg_active
+        started = time.time()
+        key = action[len("svc_"):].split(":")[0]
+        want = action.endswith(":on")
+        base = render_main(PANEL_NAMES.index("services"))
+        verb = "Turning on" if want else "Turning off"
+
+        def work():
+            ok, err = set_service(key, want, cfg, wg_peers, wg_active)
+            return ok, err, get_services_status(), get_wireguard_active()
+
+        got = run_with_spinner(base, lambda: f"{verb} {SVC_LABELS[key]}… {int(time.time() - started)}s",
+                               work, ACCENT["services"], min_visible=0.8)
+        if not got:
+            return f"Couldn't read {SVC_LABELS[key]}'s state back"
+        ok, err, svc, wg_active = got
+        refresher.put("svc", svc)
+        refresher.put("wg_active", wg_active)
+        return None if ok else err
+
+    def is_tailscale_action(action):
+        return action.startswith("ts_")
+
+    def tailscale_confirm():
+        """On re-applies all four steps from the saved choices; off asks
+        first because it drops the exit node for every device."""
+        nonlocal confirm_title, confirm_message, confirm_yes_label, confirm_action
+        nonlocal confirm_return_view, confirm_danger
+        want = not ts["enabled"]
+        confirm_title = "Tailscale"
+        if want:
+            exit_ip = cfg.get("ts_exit_node") or ""
+            exit_name = tailscale_exit_name(exit_ip, ts, cfg) or exit_ip
+            if exit_ip:
+                confirm_message = (f"Turn Tailscale on? Exit node {exit_name}, IP masquerading on. "
+                                   "All traffic will go through the exit node.")
+            else:
+                confirm_message = "Turn Tailscale on? No exit node chosen -- traffic stays direct."
+            confirm_yes_label = "Turn on"
+        else:
+            confirm_message = "Turn Tailscale off? The exit node stops and traffic goes direct."
+            confirm_yes_label = "Turn off"
+        confirm_action = f"ts_toggle:{'on' if want else 'off'}"
+        confirm_danger = not want
+        confirm_return_view = "main"
+
+    def run_tailscale_action(action, exit_ip=None):
+        """Confirmed on/off (or exit-node change while on) under a spinner,
+        then verifies every step and publishes the state read back."""
+        nonlocal ts
+        started = time.time()
+        base = render_main(PANEL_NAMES.index("tailscale"))
+        want = action.endswith(":on")
+        verb = "Connecting" if want else "Turning off"
+
+        def work():
+            ok, err = set_tailscale(want, cfg, exit_ip)
+            if not ok:
+                return False, err, get_tailscale_status()
+            done, st = wait_for_tailscale(want, cfg)
+            return done, None, st
+
+        got = run_with_spinner(base, lambda: f"{verb} Tailscale… {int(time.time() - started)}s",
+                               work, ACCENT["tailscale"], min_visible=0.8)
+        if not got:
+            return "Couldn't read Tailscale's state back"
+        ok, err, ts = got
+        refresher.put("ts", ts)
+        if remember_tailscale_exit_nodes(ts, cfg):
+            save_config(cfg)
+        if err:
+            return err
+        if ok:
+            return None
+        if want:
+            missing = [label for label, good in tailscale_steps(ts, cfg) if not good]
+            return "Not done: " + ", ".join(missing) if missing else "Tailscale didn't confirm in time"
+        return "Tailscale still running"
 
     def openclash_confirm(zone):
         """Both OpenClash actions ask first: starting/stopping it reroutes
@@ -6342,6 +7820,16 @@ def mode_live():
     fx_edit_side = "from"
     last_switch_req_check = 0.0
     refresher_seen = -1
+    last_prayer_check = 0.0
+    prayer_alert = None
+    power_menu_return = "main"
+    # Seeded with whatever is due right now, so restarting the dashboard
+    # inside an alert window doesn't pop the same alert a second time.
+    try:
+        _due = prayer_due(cfg)
+        prayer_alerted_id = _due[0] if _due else None
+    except Exception:
+        prayer_alerted_id = None
 
     def sim_toggle_confirm(zone):
         """Every SIM toggle asks first -- each one can cut this router's
@@ -6470,6 +7958,45 @@ def mode_live():
     while not _stop:
         now = time.time()
 
+        # Prayer-time alert: checked even while the screen sleeps (it wakes
+        # it), drawn over whatever is showing, dismissed by a tap or after
+        # PRAYER_ALERT_SECONDS, then the previous screen is redrawn.
+        if now - last_prayer_check >= 5:
+            last_prayer_check = now
+            try:
+                due = prayer_due(cfg)
+            except Exception:
+                due = None
+            if due and due[0] != prayer_alerted_id and prayer_alert is None:
+                prayer_alerted_id = due[0]
+                prayer_alert = {"key": due[1], "when": due[2],
+                                "city": prayer_location(cfg)[1],
+                                "until": now + PRAYER_ALERT_SECONDS,
+                                "woke": screen_wake(), "touched": False}
+                with touch_state.lock:
+                    touch_state.release_pending = False
+                write_frame(panel_prayer_alert(prayer_alert["key"], prayer_alert["when"], prayer_alert["city"]))
+        if prayer_alert is not None:
+            with touch_state.lock:
+                tapped = touch_state.release_pending
+                touching = touch_state.active
+                touch_state.release_pending = False
+            if tapped or touching:
+                prayer_alert["touched"] = True
+            if (tapped and not touching) or now >= prayer_alert["until"]:
+                if prayer_alert["woke"] and not prayer_alert["touched"]:
+                    screen_sleep()
+                prayer_alert = None
+                state = "idle"
+                neighbor_img = None
+                sub_dirty = True
+                if view == "main":
+                    cur_img = render_main(panel_idx)
+                    write_frame(cur_img)
+                    last_draw = now
+            time.sleep(0.05)
+            continue
+
         if is_screen_asleep():
             with touch_state.lock:
                 touch_state.release_pending = False
@@ -6483,13 +8010,15 @@ def mode_live():
                     os.remove(SWITCH_REQUEST_FILE)
                 except Exception:
                     pass
-                confirm_title = "Stock UI"
-                confirm_message = "Hand the screen back to the GL.iNet UI?"
-                confirm_yes_label = "Switch"
-                confirm_danger = False
-                confirm_action = "return_stock"
-                confirm_return_view = view if view != "confirm" else "main"
-                view = "confirm"
+                # A button hold now opens the power menu (Shutdown / Reboot /
+                # Stock UI / Cancel). With the dashboard running there is no
+                # stock gl_screen to show its own power-off menu on a long
+                # press, so holding the button used to offer only "switch
+                # UI" -- and accepting that by mistake also stuck across
+                # reboots.
+                if view not in ("power_menu", "confirm"):
+                    power_menu_return = view
+                view = "power_menu"
                 sub_dirty = True
 
         if view == "main":
@@ -6509,12 +8038,17 @@ def mode_live():
                     sim = refresher.get("sim", sim)
                     oc = refresher.get("oc", oc)
                     traf = refresher.get("traf", traf)
+                    ts = refresher.get("ts", ts)
+                    svc = refresher.get("svc", svc)
+                    if remember_tailscale_exit_nodes(ts, cfg):
+                        save_config(cfg)
                     wx = refresher.get("wx", wx)
                     aq = refresher.get("aq", aq)
                     sms_messages = refresher.get("sms", sms_messages)
                     rep = refresher.get("rep", rep)
                     wg_peers = refresher.get("wg_peers", wg_peers)
                     wg_active = refresher.get("wg_active", wg_active)
+                    netmode = refresher.get("netmode", netmode) or netmode
                     _cell = refresher.get("cell")
                     if _cell is not None:
                         cell_info = _cell
@@ -6589,8 +8123,16 @@ def mode_live():
                             zone = hit_main_sim(down_x, down_y)
                         elif name == "openclash":
                             zone = hit_main_openclash(down_x, down_y)
+                        elif name == "tailscale":
+                            zone = hit_main_tailscale(down_x, down_y)
+                        elif name == "services":
+                            zone = hit_main_services(down_x, down_y)
                         elif name == "weather":
                             zone = hit_main_weather(down_x, down_y)
+                        elif name == "prayer":
+                            zone = hit_main_prayer(down_x, down_y)
+                        elif name == "power":
+                            zone = hit_main_power(down_x, down_y)
                         elif name == "games":
                             zone = hit_main_games(down_x, down_y)
                         elif name == "monitor":
@@ -6653,6 +8195,17 @@ def mode_live():
                                 show_notice(blocked)
                             else:
                                 new_view = "confirm"
+                        elif name == "sim" and zone and zone.startswith("netmode:"):
+                            want_mode = zone.split(":", 1)[1]
+                            if want_mode != netmode:
+                                confirm_title = "Network mode"
+                                confirm_message = (f"Switch to {NETMODE_NAMES[want_mode]}? Internet drops for a "
+                                                   "few seconds. If it doesn't come back, it switches back by itself.")
+                                confirm_yes_label = "Switch"
+                                confirm_danger = False
+                                confirm_action = zone
+                                confirm_return_view = "main"
+                                new_view = "confirm"
                         elif name == "sim" and zone == "wireguard":
                             # Wrapped in the spinner like the other slow
                             # actions: get_wireguard_peers is now a single
@@ -6671,6 +8224,28 @@ def mode_live():
                             new_view = "wireguard"
                         elif name == "sim" and zone == "data_cap":
                             new_view = "datacap"
+                        elif name == "services" and zone and zone.startswith("svc_toggle:"):
+                            blocked = services_confirm(zone.split(":", 1)[1])
+                            if blocked:
+                                show_notice(blocked)
+                            else:
+                                new_view = "confirm"
+                        elif name == "services" and zone == "wg_pick":
+                            def _load_wireguard_svc():
+                                return get_wireguard_peers(), get_wireguard_active()
+
+                            got = run_with_spinner(cur_img, "Loading…", _load_wireguard_svc, ACCENT["services"])
+                            if got:
+                                wg_peers, wg_active = got
+                            wg_filter_country = None
+                            picker_scroll_base = 0
+                            new_view = "wireguard"
+                        elif name == "tailscale" and zone == "toggle":
+                            tailscale_confirm()
+                            new_view = "confirm"
+                        elif name == "tailscale" and zone == "exit":
+                            picker_scroll_base = 0
+                            new_view = "ts_exit"
                         elif name == "openclash" and zone in ("toggle", "flush_dns"):
                             blocked = openclash_confirm(zone)
                             if blocked:
@@ -6700,6 +8275,21 @@ def mode_live():
                         elif name == "weather" and zone == "city":
                             new_view = "weather_city"
                             picker_scroll_base = 0
+                        elif name == "prayer" and zone == "city":
+                            new_view = "prayer_country"
+                            picker_scroll_base = 0
+                        elif name == "power" and zone == "button":
+                            power_menu_return = "main"
+                            new_view = "power_menu"
+                        elif name == "prayer" and zone == "hijri":
+                            # Tap cycles the correction +1 day, wrapping
+                            # -2..+2, to follow the local moon sighting.
+                            off = cfg.get("hijri_offset", 0) + 1
+                            cfg["hijri_offset"] = -2 if off > 2 else off
+                            save_config(cfg)
+                        elif name == "prayer" and zone == "alert_toggle":
+                            cfg["prayer_alert"] = not cfg.get("prayer_alert", True)
+                            save_config(cfg)
                         elif name == "weather" and zone == "update":
                             def _refresh_weather():
                                 return (fetch_weather(cfg["weather_city"], force=True),
@@ -6787,6 +8377,24 @@ def mode_live():
                 time.sleep(0.012)
                 continue
 
+            if view == "ts_exit":
+                def _select_exit(key, base_img):
+                    # Saved as the exit node "on" uses from now on; if
+                    # Tailscale is already on, switch to it right away.
+                    if key == cfg.get("ts_exit_node"):
+                        return
+                    cfg["ts_exit_node"] = key
+                    save_config(cfg)
+                    if ts["enabled"]:
+                        msg = run_tailscale_action("ts_toggle:on", key)
+                        if msg:
+                            show_notice(msg)
+
+                items = tailscale_exit_items(ts, cfg)
+                handle_scroll_picker(now, items, lambda s: panel_ts_exit_picker(ts, cfg, s), _select_exit)
+                time.sleep(0.012)
+                continue
+
             if view == "oc_nodes":
                 def _select_node(key, base_img):
                     nonlocal traf
@@ -6824,6 +8432,40 @@ def mode_live():
 
                 items = [(name, name) for name, _, _ in WEATHER_CITIES]
                 handle_scroll_picker(now, items, lambda s: panel_weather_picker(cfg, s), _select_weather_city)
+                time.sleep(0.012)
+                continue
+
+            if view == "prayer_country":
+                picked = []
+
+                def _select_prayer_country(key, base_img=None):
+                    picked.append(key)
+
+                items = [(c, c) for c in PRAYER_COUNTRIES]
+                handle_scroll_picker(now, items, lambda s: panel_prayer_country_picker(cfg, s),
+                                     _select_prayer_country)
+                if picked:
+                    # Country chosen -> straight on to its cities (the shared
+                    # picker returns to main after a selection, so redirect).
+                    cfg["prayer_country"] = picked[0]
+                    view = "prayer_city"
+                    picker_scroll_base = 0
+                    sub_dirty = True
+                time.sleep(0.012)
+                continue
+
+            if view == "prayer_city":
+                def _select_prayer_city(key, base_img=None):
+                    cfg["prayer_city"] = key
+                    save_config(cfg)
+
+                handle_scroll_picker(now, prayer_city_items(cfg), lambda s: panel_prayer_city_picker(cfg, s),
+                                     _select_prayer_city)
+                if view == "main":
+                    # Back without picking a city: keep a valid pair saved.
+                    if cfg.get("prayer_city") not in [k for k, _ in prayer_city_items(cfg)]:
+                        cfg["prayer_city"] = prayer_city_items(cfg)[0][0]
+                    save_config(cfg)
                 time.sleep(0.012)
                 continue
 
@@ -6900,6 +8542,8 @@ def mode_live():
                 elif view == "sms_detail":
                     idx = sms_selected_idx if sms_selected_idx < len(sms_messages) else 0
                     img = panel_sms_detail(sms_messages[idx])
+                elif view == "power_menu":
+                    img = panel_power_menu()
                 else:
                     img = render_sub(view, cfg, oc, traf)
                 write_frame(img)
@@ -6926,8 +8570,16 @@ def mode_live():
                         write_frame(cur_img)
                         last_draw = now
                 elif view == "confirm" and is_tap and hit_confirm(down_x, down_y) == "yes":
-                    if is_sim_toggle_action(confirm_action) or is_openclash_action(confirm_action):
-                        apply_fn = run_sim_toggle if is_sim_toggle_action(confirm_action) else run_openclash_action
+                    if (is_sim_toggle_action(confirm_action) or is_openclash_action(confirm_action)
+                            or is_tailscale_action(confirm_action) or is_service_action(confirm_action)):
+                        if is_sim_toggle_action(confirm_action):
+                            apply_fn = run_sim_toggle
+                        elif is_tailscale_action(confirm_action):
+                            apply_fn = run_tailscale_action
+                        elif is_service_action(confirm_action):
+                            apply_fn = run_service_action
+                        else:
+                            apply_fn = run_openclash_action
                         message = apply_fn(confirm_action)
                         if message:
                             show_notice(message)
@@ -6980,6 +8632,33 @@ def mode_live():
                                                              elapsed * SPINNER_SPEED_DPS, ACCENT["clock"]))
                             time.sleep(1.0 / 25)
                         view = "main"
+                    elif confirm_action.startswith("netmode:"):
+                        want_mode = confirm_action.split(":", 1)[1]
+                        base = panel_confirm(confirm_title, confirm_message, ACCENT["sim"],
+                                             yes_label=confirm_yes_label)
+                        got = run_with_spinner(base, f"Switching to {NETMODE_NAMES[want_mode]}…",
+                                               lambda: apply_network_mode(want_mode), ACCENT["sim"])
+                        ok_mode, msg = got if got else (False, "Couldn't switch network mode")
+                        fresh_mode = get_network_mode()
+                        netmode = fresh_mode or netmode
+                        refresher.put("netmode", netmode)
+                        refresher.request("cell")
+                        if msg:
+                            show_notice(msg)
+                        view = "main"
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = time.time()
+                    elif confirm_action == "sms_delete":
+                        if sms_messages:
+                            target = sms_messages[min(sms_selected_idx, len(sms_messages) - 1)]
+                            if not delete_sms_file(target.get("path", "")):
+                                show_notice("Couldn't delete the message")
+                        sms_messages = get_sms_messages()
+                        refresher.put("sms", sms_messages)
+                        sms_selected_idx = 0
+                        picker_scroll_base = 0
+                        view = "sms"
                     elif confirm_action == "repeater_disconnect":
                         repeater_disconnect()
                         time.sleep(0.3)
@@ -7017,8 +8696,54 @@ def mode_live():
                         view = "repeater"
                         sub_dirty = True
 
+                elif view == "power_menu" and is_tap:
+                    choice = "cancel" if hit_back(down_y) else hit_power_menu(down_x, down_y)
+                    if choice in ("shutdown", "reboot"):
+                        kind = choice
+                        (reboot_router if kind == "reboot" else shutdown_router)()
+                        t0 = time.time()
+                        while time.time() - t0 < POWER_SCREEN_MAX_S and not _stop:
+                            elapsed = time.time() - t0
+                            write_frame(panel_power(kind, elapsed * SPINNER_SPEED_DPS, elapsed))
+                            with touch_state.lock:
+                                touch_state.release_pending = False
+                            time.sleep(1.0 / 20)
+                        if _stop:
+                            write_frame(panel_power(kind, final=True))
+                        else:
+                            show_notice("Reboot didn't start" if kind == "reboot" else "Shutdown didn't start")
+                        view = "main"
+                        cur_img = render_main(panel_idx)
+                        write_frame(cur_img)
+                        last_draw = time.time()
+                    elif choice == "stock":
+                        confirm_title = "Stock UI"
+                        confirm_message = "Hand the screen back to the GL.iNet UI?"
+                        confirm_yes_label = "Switch"
+                        confirm_danger = False
+                        confirm_action = "return_stock"
+                        confirm_return_view = "power_menu"
+                        view = "confirm"
+                        sub_dirty = True
+                    elif choice == "cancel":
+                        view = power_menu_return or "main"
+                        sub_dirty = True
+                        if view == "main":
+                            cur_img = render_main(panel_idx)
+                            write_frame(cur_img)
+                            last_draw = now
                 elif view == "sms_detail" and is_tap and hit_back(down_y):
                     view = "sms"
+                    sub_dirty = True
+                elif (view == "sms_detail" and is_tap and hit_sms_delete(down_x, down_y)
+                      and sms_messages and sms_messages[min(sms_selected_idx, len(sms_messages) - 1)].get("path")):
+                    confirm_title = "Delete"
+                    confirm_message = "Delete this message?"
+                    confirm_yes_label = "Delete"
+                    confirm_danger = True
+                    confirm_action = "sms_delete"
+                    confirm_return_view = "sms_detail"
+                    view = "confirm"
                     sub_dirty = True
                 elif is_tap and hit_back(down_y):
                     view = "main"

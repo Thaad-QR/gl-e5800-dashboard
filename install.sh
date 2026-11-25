@@ -10,14 +10,15 @@ echo "==> Installing dependencies on root@$ROUTER"
 ssh "root@$ROUTER" '
     opkg update
     opkg install python3 python3-numpy
-    opkg install zoneinfo-europe zoneinfo-asia zoneinfo-america zoneinfo-australia-nz zoneinfo-pacific
+    opkg install zoneinfo-europe zoneinfo-asia zoneinfo-america zoneinfo-australia-nz zoneinfo-pacific zoneinfo-africa
     opkg install --nodeps python3-pillow
     opkg install libtiff6
-    mkdir -p /root/dashboard
+    mkdir -p /root/dashboard/fonts
 '
 
 echo "==> Copying files"
 scp -O "$DIR"/src/*.py "$DIR"/src/*.sh "root@$ROUTER:/root/dashboard/"
+scp -O "$DIR"/fonts/NotoSansArabic-Medium.ttf "root@$ROUTER:/root/dashboard/fonts/"
 scp -O "$DIR"/init.d/citydash "$DIR"/init.d/homebutton "root@$ROUTER:/etc/init.d/"
 
 echo "==> Setting permissions, enabling the power-button watcher"

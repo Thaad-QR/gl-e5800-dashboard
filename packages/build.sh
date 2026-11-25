@@ -19,10 +19,11 @@ OUT="${PKG_NAME}_${VERSION}_all.ipk"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-mkdir -p "$WORK/data/root/dashboard" "$WORK/data/etc/init.d"
+mkdir -p "$WORK/data/root/dashboard/fonts" "$WORK/data/etc/init.d"
 cp ../src/*.py ../src/*.sh "$WORK/data/root/dashboard/"
 cp ../init.d/citydash ../init.d/homebutton "$WORK/data/etc/init.d/"
-chmod 755 "$WORK/data/root/dashboard/"* "$WORK/data/etc/init.d/"*
+cp ../fonts/NotoSansArabic-Medium.ttf "$WORK/data/root/dashboard/fonts/"
+chmod 755 "$WORK/data/root/dashboard/"*.py "$WORK/data/root/dashboard/"*.sh "$WORK/data/etc/init.d/"*
 
 mkdir -p "$WORK/control"
 cp control/control control/postinst control/prerm control/postrm "$WORK/control/"

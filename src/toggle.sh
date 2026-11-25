@@ -1,6 +1,7 @@
 #!/bin/sh
 # Switch the built-in screen between the custom UK/China dashboard and the
-# stock GL.iNet UI. The choice persists across reboots (enable/disable).
+# stock GL.iNet UI. "on" persists across reboots; "off" lasts until the next
+# reboot (the dashboard always comes back at boot).
 #
 # Usage: toggle.sh on|off|status
 
@@ -32,10 +33,10 @@ case "$1" in
     off)
         /etc/init.d/citydash stop
         wait_gone "dashboard/run.sh"
-        /etc/init.d/citydash disable
-        /etc/init.d/gl_screen enable
+        # Temporary only: the dashboard stays enabled at boot, so a switch
+        # to the stock screen (e.g. accepted by mistake) is undone by a reboot.
         /etc/init.d/gl_screen start
-        echo "dashboard OFF (stock screen restored)"
+        echo "dashboard OFF (stock screen until next reboot)"
         ;;
     status)
         if /etc/init.d/citydash running 2>/dev/null; then
