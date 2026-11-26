@@ -101,7 +101,7 @@ WireGuard and Tor both route all traffic, so their confirm dialog warns when a T
 
 ![FX](screenshots/fork/05_fx.png)
 
-## 8. Power page (new page, 9th dot) and power-button hold
+## 8. Power page (new page, last dot) and power-button hold
 
 - A last page with one big power button. Tapping it opens a menu: **Shut down**, **Reboot**, **Exit dashboard** (back to the stock UI), **Cancel**.
 - Holding the hardware power button (~1 s) used to offer only "exit dashboard?", so the device could not be powered off from the button while the dashboard was running. The hold now opens the same menu.
@@ -125,7 +125,23 @@ Without MudiModem no mode is highlighted and a tap just reports that the switch 
 
 GL's A/B upgrade keeps only paths listed in `/lib/upgrade/keep.d`. `/root` and opkg packages are wiped, so after an upgrade run `./install.sh` again and `toggle.sh on`. Copy `/root/dashboard/config.json` off the device first to keep your settings.
 
-## 11. Observation, not changed
+## 11. Wi-Fi QR page (new page, before Power)
+
+- Two QR codes, **2.4 GHz** and **5 GHz**. A phone camera joins the network straight from them (`WIFI:T:WPA;S:…;P:…;;`, special characters escaped, `H:true` for hidden networks).
+- SSID, key and encryption are read live from `uci` (`wireless.wifi2g` / `wireless.wifi5g`) and cached for 30 s, so a changed password shows up on its own. A disabled radio shows **Off**.
+- **Tap a code** to show it alone, full screen. With two codes on one screen the phone hesitates between them. Tap again to go back.
+- There's no QR library on the device (no `qrcode`/`segno`, no `qrencode` binary), so `qr_matrix()` is a small pure-Python byte-mode encoder: ECC level L, versions 1–20, automatic mask choice. Its output was checked with an independent decoder (jsQR), including UTF-8 / emoji SSIDs and version 7+ codes.
+
+No screenshot here, since a real one would publish my Wi-Fi password.
+
+## 12. Screen sleeps after 60 s idle
+
+- The stock UI dims the screen after `AUTO_LOCK_TIME`, but with the dashboard running nothing ever turned it off, so after boot it stayed lit forever.
+- Now an awake screen with no touch for `SCREEN_IDLE_SLEEP_S = 60` goes to sleep. Boot, every wake (power button, tap, prayer alert) and every touch restart the timer.
+- A tap on the dark screen only wakes it. It doesn't also press whatever is under the finger.
+- **Fix:** `screen_wake()` / `screen_sleep()` now call `screen_sleep.sh on|off`, the same path as the power button. Before, they wrote only the backlight level, which left the SPI panel itself blanked (`fb0/blank`), so the prayer alert "woke" a screen that stayed black.
+
+## 13. Observation, not changed
 
 The `cell` poll (5 s) and the `sms` poll (15 s) both end up talking to the modem. Together with MudiModem polling too, I saw AT-command contention. Something like 30 s and 60 s might be a kinder default. I haven't changed it, so I'm only mentioning it.
 

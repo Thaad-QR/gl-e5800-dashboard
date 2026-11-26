@@ -52,6 +52,7 @@ ACCENT = {
     "services": (150, 220, 120),
     "prayer": (110, 215, 170),
     "power": (240, 110, 110),
+    "wifiqr": (100, 190, 255),
     "weather": (90, 214, 200),
     "monitor": (235, 120, 160),
     "games": (255, 210, 90),
@@ -3750,20 +3751,20 @@ def panel_prayer_alert(key, when, city):
     return img
 
 
+SCREEN_SLEEP_SH = "/root/dashboard/screen_sleep.sh"
+SCREEN_IDLE_SLEEP_S = 60    # awake screen with no touch for this long -> sleep
+
+
 def screen_wake():
-    """Turn the backlight on if it is off. -> True when we did wake it."""
+    """Turn the screen on if it is off. -> True when we did wake it.
+    Goes through screen_sleep.sh (same as the power button): writing only
+    the backlight level left the SPI panel itself blanked (fb0/blank), so
+    the prayer alert "woke" a screen that stayed black."""
     try:
         with open(BACKLIGHT_PATH) as f:
             if f.read().strip() != "0":
                 return False
-        mx = "100"
-        try:
-            with open(BACKLIGHT_PATH.replace("brightness", "max_brightness")) as f:
-                mx = f.read().strip() or mx
-        except Exception:
-            pass
-        with open(BACKLIGHT_PATH, "w") as f:
-            f.write(mx)
+        subprocess.run([SCREEN_SLEEP_SH, "on"], timeout=5)
         _asleep_cache["ts"] = 0.0
         return True
     except Exception:
@@ -3772,8 +3773,7 @@ def screen_wake():
 
 def screen_sleep():
     try:
-        with open(BACKLIGHT_PATH, "w") as f:
-            f.write("0")
+        subprocess.run([SCREEN_SLEEP_SH, "off"], timeout=5)
         _asleep_cache["ts"] = 0.0
     except Exception:
         pass
@@ -3870,7 +3870,7 @@ PICKER_TOP, PICKER_BOTTOM = 38, 316
 # "tailscale" replaces "openclash" (local change; OpenClash isn't installed
 # here). Put "openclash" back in this slot to restore the original page.
 # "services" replaces "games" (local change). Put "games" back to restore.
-PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "tailscale", "services", "prayer", "power"]
+PANEL_NAMES = ["clock", "sim", "monitor", "weather", "fx", "tailscale", "services", "prayer", "wifiqr", "power"]
 
 TS_TOGGLE_RECT = (172, 38, 218, 60)
 TS_EXIT_ZONE = (124, 180)
@@ -5289,6 +5289,342 @@ def panel_power_menu():
         else:
             d.rounded_rectangle(box, radius=10, outline=DIM, width=2)
             centered_text_box(d, *box, label, font("default_medium", 15), DIM)
+    return img
+
+
+# ---------- Wi-Fi QR page ----------
+#
+# No QR library on the device (no qrcode/segno, no qrencode binary), so a
+# small byte-mode QR encoder lives here (structure follows Nayuki's
+# reference generator). ECC level L, versions 1-20 -- a WIFI: string is
+# well under 200 bytes.
+
+_QR_ECC_L = [-1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28]
+_QR_BLK_L = [-1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8]
+
+
+def _qr_raw_modules(ver):
+    r = (16 * ver + 128) * ver + 64
+    if ver >= 2:
+        na = ver // 7 + 2
+        r -= (25 * na - 10) * na - 55
+        if ver >= 7:
+            r -= 36
+    return r
+
+
+def _qr_mul(x, y):
+    z = 0
+    for i in reversed(range(8)):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z
+
+
+def _qr_rs_divisor(deg):
+    res = [0] * (deg - 1) + [1]
+    root = 1
+    for _ in range(deg):
+        for j in range(deg):
+            res[j] = _qr_mul(res[j], root)
+            if j + 1 < deg:
+                res[j] ^= res[j + 1]
+        root = _qr_mul(root, 2)
+    return res
+
+
+def _qr_rs_rem(data, div):
+    res = [0] * len(div)
+    for b in data:
+        f = b ^ res.pop(0)
+        res.append(0)
+        for i, c in enumerate(div):
+            res[i] ^= _qr_mul(c, f)
+    return res
+
+
+def qr_matrix(data):
+    """bytes -> square list of lists of bool (True = dark), no quiet zone."""
+    for ver in range(1, len(_QR_ECC_L)):
+        ecc, nblk = _QR_ECC_L[ver], _QR_BLK_L[ver]
+        cap = _qr_raw_modules(ver) // 8 - ecc * nblk
+        cc_bits = 8 if ver <= 9 else 16
+        if 4 + cc_bits + 8 * len(data) <= cap * 8:
+            break
+    else:
+        raise ValueError("too long for QR")
+    # --- data codewords
+    bits = []
+
+    def put(v, n):
+        bits.extend((v >> i) & 1 for i in reversed(range(n)))
+    put(0b0100, 4)
+    put(len(data), cc_bits)
+    for b in data:
+        put(b, 8)
+    put(0, min(4, cap * 8 - len(bits)))
+    put(0, (-len(bits)) % 8)
+    cw = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8)]
+    pad = 0xEC
+    while len(cw) < cap:
+        cw.append(pad)
+        pad ^= 0xEC ^ 0x11
+    # --- ECC + interleave
+    raw = _qr_raw_modules(ver) // 8
+    nshort = nblk - raw % nblk
+    slen = raw // nblk
+    div = _qr_rs_divisor(ecc)
+    blocks, k = [], 0
+    for i in range(nblk):
+        dat = cw[k:k + slen - ecc + (0 if i < nshort else 1)]
+        k += len(dat)
+        e = _qr_rs_rem(dat, div)
+        if i < nshort:
+            dat = dat + [0]
+        blocks.append(dat + e)
+    final = []
+    for i in range(len(blocks[0])):
+        for j, blk in enumerate(blocks):
+            if i != slen - ecc or j >= nshort:
+                final.append(blk[i])
+    # --- function patterns
+    size = ver * 4 + 17
+    mod = [[False] * size for _ in range(size)]
+    fn = [[False] * size for _ in range(size)]
+
+    def setf(x, y, dark):
+        mod[y][x] = dark
+        fn[y][x] = True
+    for i in range(size):
+        setf(6, i, i % 2 == 0)
+        setf(i, 6, i % 2 == 0)
+    for (fx_, fy_) in ((3, 3), (size - 4, 3), (3, size - 4)):
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                xx, yy = fx_ + dx, fy_ + dy
+                if 0 <= xx < size and 0 <= yy < size:
+                    setf(xx, yy, max(abs(dx), abs(dy)) not in (2, 4))
+    if ver > 1:
+        na = ver // 7 + 2
+        step = (ver * 8 + na * 3 + 5) // (na * 4 - 4) * 2
+        pos = [6] + sorted(size - 7 - i * step for i in range(na - 1))
+        last = len(pos) - 1
+        for i in range(len(pos)):
+            for j in range(len(pos)):
+                if (i, j) in ((0, 0), (0, last), (last, 0)):
+                    continue
+                for dy in range(-2, 3):
+                    for dx in range(-2, 3):
+                        setf(pos[i] + dx, pos[j] + dy, max(abs(dx), abs(dy)) != 1)
+
+    def draw_format(mask):
+        d_ = (1 << 3) | mask          # ECC level L = 01
+        rem = d_
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        b = ((d_ << 10) | rem) ^ 0x5412
+        bit = lambda i: ((b >> i) & 1) != 0
+        for i in range(6):
+            setf(8, i, bit(i))
+        setf(8, 7, bit(6))
+        setf(8, 8, bit(7))
+        setf(7, 8, bit(8))
+        for i in range(9, 15):
+            setf(14 - i, 8, bit(i))
+        for i in range(8):
+            setf(size - 1 - i, 8, bit(i))
+        for i in range(8, 15):
+            setf(8, size - 15 + i, bit(i))
+        setf(8, size - 8, True)
+    draw_format(0)
+    if ver >= 7:
+        rem = ver
+        for _ in range(12):
+            rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+        vb = (ver << 12) | rem
+        for i in range(18):
+            dark = ((vb >> i) & 1) != 0
+            a, b = size - 11 + i % 3, i // 3
+            setf(a, b, dark)
+            setf(b, a, dark)
+    # --- codewords, zigzag
+    i, total = 0, len(final) * 8
+    right = size - 1
+    while right >= 1:
+        if right == 6:
+            right = 5
+        for vert in range(size):
+            for j in range(2):
+                x = right - j
+                up = ((right + 1) & 2) == 0
+                y = size - 1 - vert if up else vert
+                if not fn[y][x] and i < total:
+                    mod[y][x] = ((final[i >> 3] >> (7 - (i & 7))) & 1) != 0
+                    i += 1
+        right -= 2
+    # --- mask: pick the lowest simple penalty (runs, 2x2 blocks, balance)
+    masks = [
+        lambda x, y: (x + y) % 2 == 0, lambda x, y: y % 2 == 0,
+        lambda x, y: x % 3 == 0, lambda x, y: (x + y) % 3 == 0,
+        lambda x, y: (x // 3 + y // 2) % 2 == 0, lambda x, y: x * y % 2 + x * y % 3 == 0,
+        lambda x, y: (x * y % 2 + x * y % 3) % 2 == 0, lambda x, y: ((x + y) % 2 + x * y % 3) % 2 == 0,
+    ]
+
+    def apply(m):
+        f = masks[m]
+        for y in range(size):
+            for x in range(size):
+                if not fn[y][x] and f(x, y):
+                    mod[y][x] = not mod[y][x]
+
+    def penalty():
+        p = 0
+        for grid in (mod, list(map(list, zip(*mod)))):
+            for row in grid:
+                run, prev = 0, None
+                for c in row:
+                    if c == prev:
+                        run += 1
+                    else:
+                        if run >= 5:
+                            p += run - 2
+                        run, prev = 1, c
+                if run >= 5:
+                    p += run - 2
+        for y in range(size - 1):
+            for x in range(size - 1):
+                c = mod[y][x]
+                if c == mod[y][x + 1] == mod[y + 1][x] == mod[y + 1][x + 1]:
+                    p += 3
+        dark = sum(map(sum, mod))
+        p += abs(dark * 20 - size * size * 10) // (size * size) * 10
+        return p
+    best, best_p = 0, None
+    for m in range(8):
+        apply(m)
+        draw_format(m)
+        pv = penalty()
+        if best_p is None or pv < best_p:
+            best, best_p = m, pv
+        apply(m)                     # XOR again = undo
+    apply(best)
+    draw_format(best)
+    return mod
+
+
+_wifi_cache = {"ts": -1e9, "val": None}
+
+
+def _wifi_esc(s):
+    return "".join("\\" + c if c in '\\;,:"' else c for c in s)
+
+
+def get_wifi_qr_info():
+    """[(label, ssid, wifi-string or None if off)] for 2.4G and 5G. Cached 30s."""
+    now = time.time()
+    if now - _wifi_cache["ts"] < 30 and _wifi_cache["val"] is not None:
+        return _wifi_cache["val"]
+    out = []
+    for label, sec in (("2.4 GHz", "wifi2g"), ("5 GHz", "wifi5g")):
+        g = lambda o: (run(["uci", "-q", "get", f"wireless.{sec}.{o}"]) or "").strip()
+        ssid, key, enc = g("ssid"), g("key"), g("encryption")
+        off = g("disabled") == "1" or (run(["uci", "-q", "get", f"wireless.{g('device')}.disabled"]) or "").strip() == "1"
+        if not ssid or off:
+            out.append((label, ssid, None))
+            continue
+        if enc in ("", "none", "owe"):
+            t, p = "nopass", ""
+        elif enc.startswith("wep"):
+            t, p = "WEP", key
+        else:
+            t, p = "WPA", key
+        s = f"WIFI:T:{t};S:{_wifi_esc(ssid)};"
+        if p:
+            s += f"P:{_wifi_esc(p)};"
+        if g("hidden") == "1":
+            s += "H:true;"
+        out.append((label, ssid, s + ";"))
+    _wifi_cache.update(ts=now, val=out)
+    return out
+
+
+_qr_img_cache = {}
+
+
+def qr_image(text, box):
+    """Black-on-white QR (with quiet zone) fitted into a box x box square."""
+    key = (text, box)
+    if key not in _qr_img_cache:
+        m = qr_matrix(text.encode("utf-8"))
+        n = len(m) + 4
+        s = max(1, box // n)
+        im = Image.new("RGB", (n * s, n * s), (255, 255, 255))
+        dd = ImageDraw.Draw(im)
+        for y, row in enumerate(m):
+            for x, c in enumerate(row):
+                if c:
+                    dd.rectangle([(x + 2) * s, (y + 2) * s, (x + 3) * s - 1, (y + 3) * s - 1], fill=(0, 0, 0))
+        if len(_qr_img_cache) > 8:
+            _qr_img_cache.clear()
+        _qr_img_cache[key] = im
+    return _qr_img_cache[key]
+
+
+def panel_wifi_qr(conn_type=None, cell_signal=None):
+    img, d = new_canvas()
+    accent = ACCENT["wifiqr"]
+    draw_header(d, "WI-FI", accent, conn_type, cell_signal)
+    info = get_wifi_qr_info()
+    top, slot = 44, 126
+    for i, (label, ssid, s) in enumerate(info):
+        y0 = top + i * (slot + 4)
+        centered_text(d, W / 2, y0, label, font("default_bold", 13), accent)
+        box = slot - 20
+        if s is None:
+            d.rounded_rectangle([W / 2 - box / 2, y0 + 18, W / 2 + box / 2, y0 + 18 + box],
+                                radius=8, outline=(42, 48, 60), width=1)
+            centered_text(d, W / 2, y0 + 18 + box / 2 - 8, "Off", font("default_medium", 14), DIM)
+            continue
+        try:
+            q = qr_image(s, box)
+            img.paste(q, (int(W / 2 - q.width / 2), y0 + 18 + (box - q.height) // 2))
+        except Exception:
+            centered_text(d, W / 2, y0 + 18 + box / 2 - 8, "QR error", font("default_medium", 14), DIM)
+    draw_page_dots(d, PANEL_NAMES.index("wifiqr"))
+    return img
+
+
+WIFI_QR_TOP, WIFI_QR_SLOT = 44, 126
+
+
+def hit_main_wifiqr(x, y):
+    """Tap on either QR (or its label) -> 'qr0' / 'qr1' to show it full screen."""
+    for i in range(2):
+        y0 = WIFI_QR_TOP + i * (WIFI_QR_SLOT + 4)
+        if y0 - 4 <= y <= y0 + WIFI_QR_SLOT:
+            return f"qr{i}"
+    return None
+
+
+def panel_wifi_qr_big(idx):
+    """One QR filling the screen: a phone camera locks on at once instead of
+    hesitating between two codes. Any tap goes back."""
+    img, d = new_canvas()
+    info = get_wifi_qr_info()
+    label, _, s = info[idx] if idx < len(info) else ("", "", None)
+    accent = ACCENT["wifiqr"]
+    centered_text(d, W / 2, 14, "Wi-Fi " + label, font("default_bold", 18), accent)
+    box = W - 8
+    y0 = 50
+    if s is None:
+        centered_text(d, W / 2, 150, "Off", font("default_medium", 18), DIM)
+    else:
+        try:
+            q = qr_image(s, box)
+            img.paste(q, (int(W / 2 - q.width / 2), y0 + (box - q.height) // 2))
+        except Exception:
+            centered_text(d, W / 2, 150, "QR error", font("default_medium", 18), DIM)
+    centered_text(d, W / 2, H - 24, "Tap to go back", font("default_medium", 12), DIM)
     return img
 
 
@@ -7206,6 +7542,8 @@ def mode_live():
             return panel_prayer(cfg, conn_type, cell_signal)
         elif name == "power":
             return panel_power_page(conn_type, cell_signal)
+        elif name == "wifiqr":
+            return panel_wifi_qr(conn_type, cell_signal)
         elif name == "games":
             return panel_games(game_scores)
         else:
@@ -7821,6 +8159,9 @@ def mode_live():
     last_switch_req_check = 0.0
     refresher_seen = -1
     last_prayer_check = 0.0
+    wifi_qr_big = 0
+    last_activity = time.time()   # boot counts as activity: sleep 60s after start
+    was_asleep = False
     prayer_alert = None
     power_menu_return = "main"
     # Seeded with whatever is due right now, so restarting the dashboard
@@ -7994,12 +8335,33 @@ def mode_live():
                     cur_img = render_main(panel_idx)
                     write_frame(cur_img)
                     last_draw = now
+            last_activity = now
             time.sleep(0.05)
             continue
 
         if is_screen_asleep():
             with touch_state.lock:
+                tapped = touch_state.release_pending
                 touch_state.release_pending = False
+            was_asleep = True
+            if tapped:
+                # A tap on the dark screen only wakes it; it doesn't also
+                # press whatever is under the finger.
+                screen_wake()
+            time.sleep(0.1)
+            continue
+
+        # Idle auto-sleep: any wake (power button, tap, prayer alert)
+        # restarts the 60s timer, and so does every touch while awake.
+        if was_asleep:
+            was_asleep = False
+            last_activity = now
+        with touch_state.lock:
+            if touch_state.active or touch_state.release_pending:
+                last_activity = now
+        if now - last_activity >= SCREEN_IDLE_SLEEP_S:
+            screen_sleep()
+            was_asleep = True
             time.sleep(0.1)
             continue
 
@@ -8133,6 +8495,8 @@ def mode_live():
                             zone = hit_main_prayer(down_x, down_y)
                         elif name == "power":
                             zone = hit_main_power(down_x, down_y)
+                        elif name == "wifiqr":
+                            zone = hit_main_wifiqr(down_x, down_y)
                         elif name == "games":
                             zone = hit_main_games(down_x, down_y)
                         elif name == "monitor":
@@ -8281,6 +8645,9 @@ def mode_live():
                         elif name == "power" and zone == "button":
                             power_menu_return = "main"
                             new_view = "power_menu"
+                        elif name == "wifiqr" and zone in ("qr0", "qr1"):
+                            wifi_qr_big = int(zone[2])
+                            new_view = "wifi_qr_big"
                         elif name == "prayer" and zone == "hijri":
                             # Tap cycles the correction +1 day, wrapping
                             # -2..+2, to follow the local moon sighting.
@@ -8544,6 +8911,8 @@ def mode_live():
                     img = panel_sms_detail(sms_messages[idx])
                 elif view == "power_menu":
                     img = panel_power_menu()
+                elif view == "wifi_qr_big":
+                    img = panel_wifi_qr_big(wifi_qr_big)
                 else:
                     img = render_sub(view, cfg, oc, traf)
                 write_frame(img)
@@ -8732,6 +9101,11 @@ def mode_live():
                             cur_img = render_main(panel_idx)
                             write_frame(cur_img)
                             last_draw = now
+                elif view == "wifi_qr_big" and is_tap:
+                    view = "main"
+                    cur_img = render_main(panel_idx)
+                    write_frame(cur_img)
+                    last_draw = now
                 elif view == "sms_detail" and is_tap and hit_back(down_y):
                     view = "sms"
                     sub_dirty = True
